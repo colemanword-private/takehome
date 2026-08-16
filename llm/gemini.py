@@ -5,10 +5,11 @@ import inspect
 import math
 import os
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Awaitable, Callable
 
 import httpx
+import google.auth
 from google import genai
 from google.auth import exceptions as google_auth_exceptions
 from google.genai import errors, types
@@ -269,6 +270,30 @@ class Gemini(LLM):
         )
 
 
+def check_gemini_readiness(model: str | None = None) -> dict[str, object]:
+    """Validate local Vertex configuration and ADC without calling Vertex AI."""
+    config = GeminiConfig.from_env()
+    if model is not None:
+        config = replace(config, model=model)
+    try:
+        google.auth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+    except google_auth_exceptions.DefaultCredentialsError as error:
+        raise ValueError(
+            "Application Default Credentials are missing; run "
+            "`gcloud auth application-default login`"
+        ) from error
+    return {
+        "provider": "gemini",
+        "platform": "Vertex AI",
+        "project": config.project,
+        "location": config.location,
+        "model": config.model,
+        "credentials": "found",
+    }
+
+
 def _token_counts(response: Any) -> tuple[int, int]:
     usage = getattr(response, "usage_metadata", None)
     if usage is None:
@@ -309,7 +334,9 @@ def _empty_response_message(response: Any) -> str:
     block_reason = getattr(prompt_feedback, "block_reason", None)
 
     candidates = getattr(response, "candidates", None) or []
-    finish_reason = getattr(candidates[0], "finish_reason", None) if candidates else None
+    finish_reason = (
+        getattr(candidates[0], "finish_reason", None) if candidates else None
+    )
 
     details = []
     if block_reason:
