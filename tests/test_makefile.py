@@ -48,7 +48,25 @@ def test_provider_make_targets_render_offline(
     assert result.returncode == 0, result.stderr
     assert f'--provider "{provider}"' in result.stdout
     assert f'--model "{model}"' in result.stdout
-    assert "dry-run" in result.stdout
+    results_root = "eval-results" if target == "quality" else "load-results"
+    model_path = model.replace("/", "-")
+    expected_directory = PROJECT_DIR / results_root / provider / model_path / "dry-run"
+    assert str(expected_directory) in result.stdout
+    assert "gcloud" not in result.stdout
+
+
+def test_synthetic_smoke_uses_its_own_grouped_result_directory() -> None:
+    result = subprocess.run(
+        ["make", "-n", "synthetic-smoke", "RUN_ID=dry-run"],
+        cwd=PROJECT_DIR,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    expected_directory = PROJECT_DIR / "load-results" / "synthetic" / "local" / "dry-run"
+    assert str(expected_directory) in result.stdout
     assert "gcloud" not in result.stdout
 
 

@@ -1,0 +1,125 @@
+{
+  "schema_version": 1,
+  "run_id": "20260816T230754Z",
+  "scope": {
+    "provider": "Gemini",
+    "platform": "Vertex AI",
+    "location": "global",
+    "model": "gemini-2.5-flash",
+    "soak_performed": false,
+    "raw_artifacts_gitignored": true
+  },
+  "runtime": {
+    "python": "3.12.8",
+    "google-genai": "2.13.0",
+    "httpx": "0.28.1"
+  },
+  "quality": {
+    "dataset_sha256": "ce990b305480357f887dc6fdf4cbc5a6e6e596af25a4850818bdf2cff443c6a5",
+    "dataset_version": 2,
+    "baseline": {
+      "thinking_budget": null,
+      "max_output_tokens": null,
+      "max_retries": 0,
+      "cases": 10,
+      "passed": 10,
+      "failed": 0,
+      "elapsed_seconds": 8.923909708857536,
+      "observed_input_tokens": 433,
+      "observed_output_tokens": 2135
+    },
+    "controlled": {
+      "thinking_budget": 0,
+      "max_output_tokens": 256,
+      "max_retries": 0,
+      "cases": 10,
+      "passed": 10,
+      "failed": 0,
+      "elapsed_seconds": 3.663531666621566,
+      "observed_input_tokens": 433,
+      "observed_output_tokens": 106
+    }
+  },
+  "load": {
+    "workload_sha256": "ea8a690cb6b3d4189e403cd279a0628d12e20c2d247963b00c2fd0f2b979799a",
+    "measured_live_requests": 1411,
+    "quality_cases": 20,
+    "warmup_requests": 35,
+    "measured_failures": 0,
+    "measured_retries": 0,
+    "capacity_stages": [
+      {
+        "offered_rps": 1,
+        "requests": 30,
+        "successful_rps": 1.0100228863675857,
+        "service_latency_ms": {"p50": 633.6110001429915, "p95": 1896.84574957937, "p99": 2411.4672923460603},
+        "queue_delay_p95_ms": 2.1777506917715073
+      },
+      {
+        "offered_rps": 3,
+        "requests": 90,
+        "successful_rps": 2.9493394543291487,
+        "service_latency_ms": {"p50": 608.0683330073953, "p95": 1627.52537522465, "p99": 3845.610000193119},
+        "queue_delay_p95_ms": 4.5254165306687355
+      },
+      {
+        "offered_rps": 5,
+        "requests": 150,
+        "successful_rps": 4.846617787825868,
+        "service_latency_ms": {"p50": 611.3382093608379, "p95": 1162.911457940936, "p99": 1790.8387491479516},
+        "queue_delay_p95_ms": 7.014458067715168
+      },
+      {
+        "offered_rps": 8,
+        "requests": 240,
+        "successful_rps": 7.864526174285009,
+        "service_latency_ms": {"p50": 625.7074577733874, "p95": 1067.1952906996012, "p99": 1717.2055412083864},
+        "queue_delay_p95_ms": 6.136083044111729
+      },
+      {
+        "offered_rps": 10,
+        "requests": 300,
+        "successful_rps": 9.754867205272808,
+        "service_latency_ms": {"p50": 610.5783749371767, "p95": 1241.3398334756494, "p99": 1529.9780825152993},
+        "queue_delay_p95_ms": 4.230000078678131
+      }
+    ],
+    "retry_comparison": {
+      "offered_rps": 10,
+      "requests_per_run": 300,
+      "retries_off": {
+        "max_retries": 0,
+        "successful_rps": 9.735804411356058,
+        "measured_failures": 0,
+        "measured_retries": 0,
+        "service_latency_ms": {"p50": 622.527040541172, "p95": 1041.565333493054, "p99": 2205.4042918607593},
+        "queue_delay_p95_ms": 5.320541560649872
+      },
+      "retries_on": {
+        "max_retries": 4,
+        "successful_rps": 9.685858028722869,
+        "measured_failures": 0,
+        "measured_retries": 0,
+        "service_latency_ms": {"p50": 573.1864161789417, "p95": 1068.1675830855966, "p99": 1618.643207475543},
+        "queue_delay_p95_ms": 5.898166447877884
+      }
+    }
+  },
+  "raw_artifact_sha256": {
+    "eval-results/gemini/gemini-2.5-flash/20260816T230754Z/02-gemini-quality-baseline.json": "3a6b56e1efbb32b65c71b23dbd67681704f4c33bda83a142147f19dd5bba4c5f",
+    "eval-results/gemini/gemini-2.5-flash/20260816T230754Z/03-gemini-quality-controlled.json": "562c02a0ed0cafd37b9f85c6657d644b3f4b7c90a2cefc7e44bb292092f4095d",
+    "load-results/synthetic/local/20260816T230754Z/00-synthetic-smoke.json": "32b5c573e52fe1bea902d1aabbb56a08c0e76c30bb851f8b22fc27d755cdeb4d",
+    "load-results/gemini/gemini-2.5-flash/20260816T230754Z/01-gemini-smoke.json": "7c3304c1d0ce91e5fa2538f9078385aa211bbe142552e67124a9d28f155a2d0a",
+    "load-results/gemini/gemini-2.5-flash/20260816T230754Z/04-gemini-capacity-1rps.json": "aad7655103fb7ef742848d57618d4f899af1608468ab37ff87ed88043b2cbc28",
+    "load-results/gemini/gemini-2.5-flash/20260816T230754Z/04-gemini-capacity-3rps.json": "f55908b28673852d1c44c9f6841dfdb1163f6afa084180465a0b7de2ab5a873a",
+    "load-results/gemini/gemini-2.5-flash/20260816T230754Z/04-gemini-capacity-5rps.json": "0bd0cea06bb965c52f0aff159868711b3d906f86c12ae8557f503adda254902c",
+    "load-results/gemini/gemini-2.5-flash/20260816T230754Z/04-gemini-capacity-8rps.json": "359db102d22601a43cefc9d04fe45d7ebbd591de8e15241b665c4f183d11f13d",
+    "load-results/gemini/gemini-2.5-flash/20260816T230754Z/04-gemini-capacity-10rps.json": "3bb98ad7ba7546d4537037c0f6c6f5901888f8001f1a1f14d4c2e17733c69650",
+    "load-results/gemini/gemini-2.5-flash/20260816T230754Z/05-gemini-retry-off-10rps.json": "aa3f97213b77048f31f0d0643ffa68f9de56966f17970e653172bc967318e67b",
+    "load-results/gemini/gemini-2.5-flash/20260816T230754Z/06-gemini-retry-on-10rps.json": "98604d1a03fd852356207dd66095905c46c50748a7f998305dd0703396743f5a"
+  },
+  "redaction": {
+    "excluded": ["project identifier", "credentials", "prompts", "generated outputs", "error messages"],
+    "note": "The local raw artifacts can be verified against the SHA-256 manifest and supplied separately if needed."
+  }
+}

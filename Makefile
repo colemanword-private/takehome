@@ -17,8 +17,17 @@ RUN_ID ?= $(shell date -u +%Y%m%dT%H%M%SZ)
 RUN_ID := $(RUN_ID)
 LOAD_RESULTS_ROOT ?= $(PROJECT_DIR)/load-results
 EVAL_RESULTS_ROOT ?= $(PROJECT_DIR)/eval-results
-LOAD_RESULTS_DIR ?= $(LOAD_RESULTS_ROOT)/$(RUN_ID)
-EVAL_RESULTS_DIR ?= $(EVAL_RESULTS_ROOT)/$(RUN_ID)
+
+# Keep each provider/model's runs together. Replace characters commonly used in
+# model IDs but unsuitable for a single directory component (for example, `/`).
+empty :=
+space := $(empty) $(empty)
+sanitize_path = $(subst $(space),-,$(subst /,-,$(subst :,-,$(subst @,-,$(strip $(1))))))
+PROVIDER_PATH = $(call sanitize_path,$(PROVIDER))
+MODEL_PATH = $(if $(strip $(MODEL)),$(call sanitize_path,$(MODEL)),default)
+LOAD_RESULTS_DIR ?= $(LOAD_RESULTS_ROOT)/$(PROVIDER_PATH)/$(MODEL_PATH)/$(RUN_ID)
+EVAL_RESULTS_DIR ?= $(EVAL_RESULTS_ROOT)/$(PROVIDER_PATH)/$(MODEL_PATH)/$(RUN_ID)
+SYNTHETIC_RESULTS_DIR ?= $(LOAD_RESULTS_ROOT)/synthetic/local/$(RUN_ID)
 
 # These controls are mapped by the selected provider rather than by this Makefile.
 TEMPERATURE ?= 0
@@ -83,7 +92,7 @@ help:
 		'  MAX_OUTPUT_TOKENS=1024 THINKING_BUDGET=512 TEMPERATURE=0' \
 		'  RUN_ID=20260816T222927Z  Reuse one run directory across invocations.' \
 		'' \
-		'Each invocation writes under load-results/<RUN_ID>/ or eval-results/<RUN_ID>/.' \
+		'Results use <root>/<provider>/<model>/<RUN_ID>/ (synthetic uses synthetic/local).' \
 		'These scratch roots remain ignored by git. Review and redact artifacts' \
 		'before copying curated results into an evidence/ directory.'
 
@@ -113,7 +122,7 @@ check-config check-adc: check-provider
 
 # Create this invocation's timestamped output directories.
 prepare-results:
-	@mkdir -p "$(LOAD_RESULTS_DIR)" "$(EVAL_RESULTS_DIR)"
+	@mkdir -p "$(LOAD_RESULTS_DIR)" "$(EVAL_RESULTS_DIR)" "$(SYNTHETIC_RESULTS_DIR)"
 
 # Run the complete offline unit suite. Tests use fakes and send no provider requests.
 test: check-python
@@ -129,7 +138,7 @@ synthetic-smoke: check-python prepare-results
 		--concurrency 128 \
 		--warmup-requests 0 \
 		--temperature "$(TEMPERATURE)" \
-		--output "$(LOAD_RESULTS_DIR)/00-synthetic-smoke.json"
+		--output "$(SYNTHETIC_RESULTS_DIR)/00-synthetic-smoke.json"
 
 # BILLABLE: send one bounded request through the selected provider to verify auth,
 # request mapping, and result persistence before starting larger experiments.
