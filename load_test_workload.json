@@ -1,0 +1,10 @@
+{
+  "system_prompt": "You are a concise marketing analytics assistant. Follow the requested output format exactly and do not invent unavailable facts.",
+  "questions": [
+    "Classify the sentiment of this customer feedback as positive, neutral, or negative, then give one short reason: 'The dashboard is useful, but exports take too long.'",
+    "Summarize this campaign note in one sentence: 'Brand search spend rose 12%, conversions rose 18%, and cost per acquisition fell 5% week over week.'",
+    "Return only JSON with keys category and urgency for this request: 'Our daily attribution report has not updated since yesterday morning.'",
+    "Rewrite this ad headline in at most 10 words: 'Get clearer insight into how every marketing dollar performs.'",
+    "Name two data-quality checks for a table of daily campaign spend. Answer in one sentence."
+  ]
+}

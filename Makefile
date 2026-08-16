@@ -1,0 +1,263 @@
+SHELL := /bin/bash
+.DEFAULT_GOAL := help
+
+PROJECT_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+PYTHON ?= $(PROJECT_DIR)/.venv/bin/python
+ENV_FILE ?= $(PROJECT_DIR)/.env
+
+# Select any provider registered in llm/providers.py. Gemini gets the assignment's
+# target model by default; other providers may use MODEL or their environment setting.
+PROVIDER ?= gemini
+MODEL ?= $(if $(filter gemini,$(PROVIDER)),gemini-2.5-flash,)
+PROVIDER_ARGS = --provider "$(PROVIDER)" $(if $(strip $(MODEL)),--model "$(MODEL)")
+
+# Resolve the timestamp once so every target in one Make invocation shares a run.
+# Override RUN_ID to group separate invocations into the same experiment campaign.
+RUN_ID ?= $(shell date -u +%Y%m%dT%H%M%SZ)
+RUN_ID := $(RUN_ID)
+LOAD_RESULTS_ROOT ?= $(PROJECT_DIR)/load-results
+EVAL_RESULTS_ROOT ?= $(PROJECT_DIR)/eval-results
+LOAD_RESULTS_DIR ?= $(LOAD_RESULTS_ROOT)/$(RUN_ID)
+EVAL_RESULTS_DIR ?= $(EVAL_RESULTS_ROOT)/$(RUN_ID)
+
+# These controls are mapped by the selected provider rather than by this Makefile.
+TEMPERATURE ?= 0
+MAX_OUTPUT_TOKENS ?= 256
+THINKING_BUDGET ?=
+THINKING_BUDGET_ARG = $(if $(strip $(THINKING_BUDGET)),--thinking-budget "$(THINKING_BUDGET)")
+PROVIDER_CONTROL_ARGS = \
+	--max-output-tokens "$(MAX_OUTPUT_TOKENS)" \
+	$(THINKING_BUDGET_ARG)
+
+RAMP_RPS ?= 1 3 5 8 10
+RAMP_DURATION_SECONDS ?= 60
+RAMP_CONCURRENCY ?= 160
+
+# Set these only after the capacity ramp identifies a candidate operating point.
+RETRY_RPS ?=
+RETRY_DURATION_SECONDS ?= 60
+RETRY_CONCURRENCY ?= 160
+PRODUCTION_RETRIES ?= 4
+
+SOAK_RPS ?=
+SOAK_DURATION_SECONDS ?= 900
+SOAK_CONCURRENCY ?= 160
+
+# Load optional provider credentials and settings from .env without embedding any
+# Gemini-, Vertex-, or Together-specific variables in the experiment workflow.
+define LOAD_PROVIDER_ENV
+set -a; \
+if [ -f "$(ENV_FILE)" ]; then source "$(ENV_FILE)"; fi; \
+set +a;
+endef
+
+.PHONY: \
+	help bootstrap check-python check-provider check-config check-adc \
+	prepare-results test synthetic-smoke provider-smoke vertex-smoke quality \
+	quality-baseline quality-controlled capacity-ramp retry-off retry-on soak \
+	load-test quality-test
+
+# Print available workflows and common overrides. This sends no provider requests.
+help:
+	@printf '%s\n' \
+		'Local verification:' \
+		'  make bootstrap              Create/update .venv and result directories.' \
+		'  make test                   Run the offline unit test suite.' \
+		'  make synthetic-smoke        Exercise only the local load harness.' \
+		'  make check-provider         Validate local config and credentials.' \
+		'' \
+		'Provider experiments (billable):' \
+		'  make provider-smoke         Make one low-cost provider request.' \
+		'  make quality                Run baseline and controlled quality evals.' \
+		'  make capacity-ramp          Run staged load with retries off.' \
+		'  make retry-off RETRY_RPS=N  Measure the selected rate without retries.' \
+		'  make retry-on RETRY_RPS=N   Repeat it with production retries.' \
+		'  make soak SOAK_RPS=N        Hold an operating point for 15 minutes.' \
+		'' \
+		'Provider selection:' \
+		'  PROVIDER=gemini MODEL=gemini-2.5-flash' \
+		'  PROVIDER=together MODEL=organization/model' \
+		'' \
+		'Useful overrides:' \
+		'  RAMP_RPS="1 3 5" RAMP_CONCURRENCY=96 RAMP_DURATION_SECONDS=300' \
+		'  MAX_OUTPUT_TOKENS=1024 THINKING_BUDGET=512 TEMPERATURE=0' \
+		'  RUN_ID=20260816T222927Z  Reuse one run directory across invocations.' \
+		'' \
+		'Each invocation writes under load-results/<RUN_ID>/ or eval-results/<RUN_ID>/.' \
+		'These scratch roots remain ignored by git. Review and redact artifacts' \
+		'before copying curated results into an evidence/ directory.'
+
+# Create the virtual environment if needed, install dependencies, and create result
+# roots. This may contact the package index, but it sends no LLM requests.
+bootstrap:
+	@command -v "$(PYTHON)" >/dev/null 2>&1 || python3 -m venv "$(PROJECT_DIR)/.venv"
+	@"$(PYTHON)" -m pip install -r "$(PROJECT_DIR)/requirements.txt"
+	@mkdir -p "$(LOAD_RESULTS_ROOT)" "$(EVAL_RESULTS_ROOT)"
+
+# Fail with setup guidance when the configured Python executable is unavailable.
+check-python:
+	@test -x "$(PYTHON)" || { \
+		echo 'Python environment is missing; run `make bootstrap` first.' >&2; \
+		exit 1; \
+	}
+
+# Delegate configuration and credential validation to the selected provider. This
+# performs configuration and credential discovery but sends no inference request.
+check-provider: check-python
+	@set -eu; \
+	$(LOAD_PROVIDER_ENV) \
+	"$(PYTHON)" "$(PROJECT_DIR)/provider_check.py" $(PROVIDER_ARGS)
+
+# Compatibility aliases for the original Gemini-specific preflight target names.
+check-config check-adc: check-provider
+
+# Create this invocation's timestamped output directories.
+prepare-results:
+	@mkdir -p "$(LOAD_RESULTS_DIR)" "$(EVAL_RESULTS_DIR)"
+
+# Run the complete offline unit suite. Tests use fakes and send no provider requests.
+test: check-python
+	@cd "$(PROJECT_DIR)" && "$(PYTHON)" -m pytest -q
+
+# Stress the local scheduler with synthetic responses and save a timestamped report.
+# This validates harness behavior, not any external provider's latency or capacity.
+synthetic-smoke: check-python prepare-results
+	@"$(PYTHON)" "$(PROJECT_DIR)/load_test.py" \
+		--synthetic \
+		--requests 10000 \
+		--rps 0 \
+		--concurrency 128 \
+		--warmup-requests 0 \
+		--temperature "$(TEMPERATURE)" \
+		--output "$(LOAD_RESULTS_DIR)/00-synthetic-smoke.json"
+
+# BILLABLE: send one bounded request through the selected provider to verify auth,
+# request mapping, and result persistence before starting larger experiments.
+provider-smoke: check-provider prepare-results
+	@set -eu; \
+	$(LOAD_PROVIDER_ENV) \
+	"$(PYTHON)" "$(PROJECT_DIR)/load_test.py" \
+		$(PROVIDER_ARGS) \
+		$(PROVIDER_CONTROL_ARGS) \
+		--max-retries 0 \
+		--requests 1 \
+		--rps 1 \
+		--concurrency 1 \
+		--warmup-requests 0 \
+		--temperature "$(TEMPERATURE)" \
+		--output "$(LOAD_RESULTS_DIR)/01-$(PROVIDER)-smoke.json"
+
+# BILLABLE: run both quality evaluations to compare environment-configured behavior
+# with explicit supported controls for the selected provider.
+quality: quality-baseline quality-controlled
+
+# BILLABLE: evaluate all golden cases with retries disabled and otherwise use the
+# selected provider's environment-configured defaults.
+quality-baseline: check-provider prepare-results
+	@set -eu; \
+	$(LOAD_PROVIDER_ENV) \
+	"$(PYTHON)" "$(PROJECT_DIR)/quality_eval.py" \
+		$(PROVIDER_ARGS) \
+		--max-retries 0 \
+		--concurrency 2 \
+		--output "$(EVAL_RESULTS_DIR)/02-$(PROVIDER)-quality-baseline.json"
+
+# BILLABLE: repeat the golden cases with explicit supported controls and no retries,
+# so quality, token, and latency changes remain directly observable.
+quality-controlled: check-provider prepare-results
+	@set -eu; \
+	$(LOAD_PROVIDER_ENV) \
+	"$(PYTHON)" "$(PROJECT_DIR)/quality_eval.py" \
+		$(PROVIDER_ARGS) \
+		$(PROVIDER_CONTROL_ARGS) \
+		--max-retries 0 \
+		--concurrency 2 \
+		--output "$(EVAL_RESULTS_DIR)/03-$(PROVIDER)-quality-controlled.json"
+
+# BILLABLE: step through RAMP_RPS for RAMP_DURATION_SECONDS per stage, with five
+# warmups and retries disabled. Stop at the first failed stage and inspect its report.
+capacity-ramp: check-provider prepare-results
+	@set -eu; \
+	$(LOAD_PROVIDER_ENV) \
+	for rps in $(RAMP_RPS); do \
+		requests=$$((rps * $(RAMP_DURATION_SECONDS))); \
+		output="$(LOAD_RESULTS_DIR)/04-$(PROVIDER)-capacity-$${rps}rps.json"; \
+		echo "Running $$requests requests against $(PROVIDER) at $$rps RPS..."; \
+		"$(PYTHON)" "$(PROJECT_DIR)/load_test.py" \
+			$(PROVIDER_ARGS) \
+			$(PROVIDER_CONTROL_ARGS) \
+			--max-retries 0 \
+			--requests "$$requests" \
+			--rps "$$rps" \
+			--concurrency "$(RAMP_CONCURRENCY)" \
+			--warmup-requests 5 \
+			--temperature "$(TEMPERATURE)" \
+			--output "$$output"; \
+	done
+
+# BILLABLE: measure RETRY_RPS with retries disabled to establish the unamplified
+# failure rate before testing a production retry policy.
+retry-off: check-provider prepare-results
+	@set -eu; \
+	$(LOAD_PROVIDER_ENV) \
+	test -n "$(strip $(RETRY_RPS))" || { \
+		echo 'Set RETRY_RPS to a rate selected from the capacity ramp.' >&2; \
+		exit 1; \
+	}; \
+	requests=$$(( $(RETRY_RPS) * $(RETRY_DURATION_SECONDS) )); \
+	"$(PYTHON)" "$(PROJECT_DIR)/load_test.py" \
+		$(PROVIDER_ARGS) \
+		$(PROVIDER_CONTROL_ARGS) \
+		--max-retries 0 \
+		--requests "$$requests" \
+		--rps "$(RETRY_RPS)" \
+		--concurrency "$(RETRY_CONCURRENCY)" \
+		--warmup-requests 5 \
+		--temperature "$(TEMPERATURE)" \
+		--output "$(LOAD_RESULTS_DIR)/05-$(PROVIDER)-retry-off-$(RETRY_RPS)rps.json"
+
+# BILLABLE: repeat RETRY_RPS with PRODUCTION_RETRIES so availability, latency, and
+# extra attempts can be compared directly with the retry-off artifact.
+retry-on: check-provider prepare-results
+	@set -eu; \
+	$(LOAD_PROVIDER_ENV) \
+	test -n "$(strip $(RETRY_RPS))" || { \
+		echo 'Set RETRY_RPS to a rate selected from the capacity ramp.' >&2; \
+		exit 1; \
+	}; \
+	requests=$$(( $(RETRY_RPS) * $(RETRY_DURATION_SECONDS) )); \
+	"$(PYTHON)" "$(PROJECT_DIR)/load_test.py" \
+		$(PROVIDER_ARGS) \
+		$(PROVIDER_CONTROL_ARGS) \
+		--max-retries "$(PRODUCTION_RETRIES)" \
+		--requests "$$requests" \
+		--rps "$(RETRY_RPS)" \
+		--concurrency "$(RETRY_CONCURRENCY)" \
+		--warmup-requests 5 \
+		--temperature "$(TEMPERATURE)" \
+		--output "$(LOAD_RESULTS_DIR)/06-$(PROVIDER)-retry-on-$(RETRY_RPS)rps.json"
+
+# BILLABLE: hold SOAK_RPS for SOAK_DURATION_SECONDS to expose sustained latency,
+# queueing, credential-refresh, or resource problems at the chosen operating point.
+soak: check-provider prepare-results
+	@set -eu; \
+	$(LOAD_PROVIDER_ENV) \
+	test -n "$(strip $(SOAK_RPS))" || { \
+		echo 'Set SOAK_RPS to roughly 60-70% of the measured capacity knee.' >&2; \
+		exit 1; \
+	}; \
+	requests=$$(( $(SOAK_RPS) * $(SOAK_DURATION_SECONDS) )); \
+	"$(PYTHON)" "$(PROJECT_DIR)/load_test.py" \
+		$(PROVIDER_ARGS) \
+		$(PROVIDER_CONTROL_ARGS) \
+		--max-retries "$(PRODUCTION_RETRIES)" \
+		--requests "$$requests" \
+		--rps "$(SOAK_RPS)" \
+		--concurrency "$(SOAK_CONCURRENCY)" \
+		--warmup-requests 5 \
+		--temperature "$(TEMPERATURE)" \
+		--output "$(LOAD_RESULTS_DIR)/07-$(PROVIDER)-soak-$(SOAK_RPS)rps.json"
+
+# Backward-compatible aliases for earlier instructions and scripts.
+vertex-smoke load-test: provider-smoke
+quality-test: quality-baseline
