@@ -1,0 +1,129 @@
+{
+  "name": "marketing-assistant-quality-floor",
+  "version": 2,
+  "description": "Objective correctness and instruction-following cases for the marketing analytics assistant.",
+  "cases": [
+    {
+      "id": "sentiment-positive-001",
+      "category": "classification",
+      "system_prompt": "Classify customer feedback. Return exactly one lowercase label: positive, neutral, or negative.",
+      "input": "The campaign dashboard is fast, clear, and saves our team hours every week.",
+      "temperature": 0,
+      "validators": [
+        {"type": "exact_match", "expected": "positive"}
+      ]
+    },
+    {
+      "id": "sentiment-neutral-001",
+      "category": "classification",
+      "system_prompt": "Classify customer feedback. Return exactly one lowercase label: positive, neutral, or negative.",
+      "input": "The monthly report was delivered on Tuesday as scheduled.",
+      "temperature": 0,
+      "validators": [
+        {"type": "exact_match", "expected": "neutral"}
+      ]
+    },
+    {
+      "id": "sentiment-negative-001",
+      "category": "classification",
+      "system_prompt": "Classify customer feedback. Return exactly one lowercase label: positive, neutral, or negative.",
+      "input": "The export failed again and support has not replied for three days.",
+      "temperature": 0,
+      "validators": [
+        {"type": "exact_match", "expected": "negative"}
+      ]
+    },
+    {
+      "id": "incident-json-001",
+      "category": "structured-output",
+      "system_prompt": "Classify the request. Allowed categories are data_incident and feature_request; allowed urgency values are high and low. Broken existing reporting is a high-urgency data_incident. Desired nonurgent functionality is a low-urgency feature_request. Return only a JSON object with category and urgency. Do not use Markdown.",
+      "input": "Our daily attribution report has not updated since yesterday morning.",
+      "temperature": 0,
+      "validators": [
+        {
+          "type": "json_equals",
+          "expected": {"category": "data_incident", "urgency": "high"}
+        }
+      ]
+    },
+    {
+      "id": "incident-json-002",
+      "category": "structured-output",
+      "system_prompt": "Classify the request. Allowed categories are data_incident and feature_request; allowed urgency values are high and low. Broken existing reporting is a high-urgency data_incident. Desired nonurgent functionality is a low-urgency feature_request. Return only a JSON object with category and urgency. Do not use Markdown.",
+      "input": "Please add a dark mode option to the dashboard someday.",
+      "temperature": 0,
+      "validators": [
+        {
+          "type": "json_equals",
+          "expected": {"category": "feature_request", "urgency": "low"}
+        }
+      ]
+    },
+    {
+      "id": "campaign-summary-001",
+      "category": "summarization",
+      "system_prompt": "Summarize the supplied campaign note in exactly one sentence. Preserve every percentage and do not introduce new percentages.",
+      "input": "Brand search spend rose 12%, conversions rose 18%, and cost per acquisition fell 5% week over week.",
+      "temperature": 0,
+      "validators": [
+        {"type": "non_empty"},
+        {"type": "max_sentences", "max": 1},
+        {
+          "type": "percentage_facts",
+          "expected": ["12%", "18%", "5%"],
+          "allow_additional": false
+        }
+      ]
+    },
+    {
+      "id": "campaign-summary-002",
+      "category": "summarization",
+      "system_prompt": "Summarize the supplied campaign note in exactly one sentence. Preserve the named channels and do not invent numerical results.",
+      "input": "Paid search improved while display declined; social performance was unchanged. No numerical measurements were provided.",
+      "temperature": 0,
+      "validators": [
+        {"type": "max_sentences", "max": 1},
+        {"type": "contains_all", "values": ["search", "display", "social"]},
+        {"type": "regex", "pattern": "^(?!.*\\d).+$"}
+      ]
+    },
+    {
+      "id": "headline-rewrite-001",
+      "category": "instruction-following",
+      "system_prompt": "Rewrite the headline in at most 10 words. Return only the rewritten headline.",
+      "input": "Get clearer insight into how every marketing dollar performs.",
+      "temperature": 0,
+      "validators": [
+        {"type": "non_empty"},
+        {"type": "max_words", "max": 10},
+        {"type": "contains_any", "values": ["marketing", "spend", "dollar", "performance"]}
+      ]
+    },
+    {
+      "id": "data-quality-checks-001",
+      "category": "instruction-following",
+      "system_prompt": "Name checks for missing spend and duplicate campaign-date rows in one sentence. Do not mention unrelated checks.",
+      "input": "What two data-quality checks should run on a daily campaign spend table?",
+      "temperature": 0,
+      "validators": [
+        {"type": "max_sentences", "max": 1},
+        {
+          "type": "regex",
+          "pattern": "\\b(?:missing|null|absent|incomplete|completeness)\\b|\\b(?:all\\s+)?(?:expected\\s+)?spend(?:\\s+(?:values?|entries))?\\s+(?:is|are)\\s+present\\b"
+        },
+        {"type": "contains_any", "values": ["duplicate", "duplicated"]},
+        {"type": "excludes_all", "values": ["sentiment", "grammar", "color"]}
+      ]
+    },
+    {
+      "id": "no-invented-facts-001",
+      "category": "groundedness",
+      "system_prompt": "Answer using only the supplied note. If the requested fact is absent, return exactly: unavailable",
+      "input": "Note: Conversions rose week over week. What was the conversion increase percentage?",
+      "temperature": 0,
+      "validators": [
+        {"type": "exact_match", "expected": "unavailable"}
+      ]
+    }
+  ]
+}
