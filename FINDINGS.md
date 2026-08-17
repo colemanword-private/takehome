@@ -2,10 +2,14 @@
 
 ## Executive summary
 
-I would approve this integration for a monitored production pilot at **24
-RPS** for this short-prompt workload — thinking explicitly disabled, a
-256-token output bound, and the implemented retry controls — with **12.5×
-demonstrated headroom** behind that number.
+I would approve this integration for a monitored production pilot
+**starting at 24 RPS, ramping to 100 RPS as soak hours accumulate, with a
+hard pilot ceiling of 300 RPS** — thinking explicitly disabled, a 256-token
+output bound, and the implemented retry controls. Each stage is pinned to
+its own evidence tier: 24 RPS has five minutes of direct confirmation at
+the exact proposed configuration, 300 RPS is the highest rate sustained
+cleanly with production retries (60 seconds, 18,000/18,000), and the ramp
+between them is gated on the multi-hour data the pilot itself produces.
 
 Two campaigns support this. The single-process campaign confirmed the
 operating point (7,200/7,200 requests over five minutes at a realized 24.000
