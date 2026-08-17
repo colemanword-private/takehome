@@ -37,6 +37,15 @@ The campaign ran on 2026-08-16 under run ID `20260816T230754Z`.
 | Capacity-stage retries | 0 |
 | Capacity/retry harness concurrency | 64 |
 
+The table above describes the retained `20260816T230754Z` campaign. The
+implementation was hardened after that campaign: both registered providers now
+default to a 20-second attempt timeout inside a 60-second end-to-end request
+deadline, honor provider `Retry-After` guidance, and share a token-bucket retry
+budget across requests. The load harness now bounds pending arrivals at four
+times configured concurrency by default. These controls are covered by offline
+fault-injection tests, but the retained live campaign predates them and should
+be rerun before a production decision relies on the new behavior.
+
 The open-loop workload contains five short marketing-assistant questions and a
 stable SHA-256 fingerprint:
 `ea8a690cb6b3d4189e403cd279a0628d12e20c2d247963b00c2fd0f2b979799a`.
@@ -51,7 +60,8 @@ highest tested rate. No soak test was run.
 
 ## Offline verification
 
-- All 88 unit tests passed. The tests use fake provider clients and make no live
+- At campaign time, all 88 unit tests passed. The current hardened implementation
+  has 123 passing offline tests; they use fake provider clients and make no live
   LLM calls.
 - The synthetic harness completed 10,000 burst-scheduled requests with zero
   failures. Synthetic service latency was p50 1.06 ms and p95 1.22 ms. This
@@ -152,6 +162,15 @@ as exact cost.
 - The shared retry engine owns timing and telemetry, while each provider owns
   error classification. This avoids duplicating backoff logic without pretending
   provider error semantics are universal.
+- Both registered providers configure the shared retry engine with a total
+  request deadline across attempts and backoff plus a shared token bucket, so
+  concurrent failures cannot multiply into an unbounded retry storm. Each
+  provider instance owns one process-local budget; separately deployed workers
+  have independent buckets. Both providers also honor server retry delays and
+  record terminal exhaustion reasons.
+- The load harness bounds pending arrivals while retaining their original
+  scheduled timestamps, so overload produces visible queue delay without
+  unbounded pending-work growth.
 - Retries were disabled during the capacity ramp so they could not hide raw
   failure rates or amplify overload.
 - Thinking tokens count as output usage because they affect capacity and cost

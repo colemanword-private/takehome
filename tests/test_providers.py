@@ -49,17 +49,36 @@ def test_shared_cli_arguments_use_registry_choices() -> None:
     }
 
 
+def test_provider_options_preserve_original_positional_observer_field() -> None:
+    observer = lambda _: None
+
+    options = ProviderOptions(None, None, None, None, observer)
+
+    assert options.on_retry is observer
+    assert options.on_backoff is None
+    assert options.on_exhausted is None
+
+
 def test_gemini_factory_maps_shared_controls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "project-id")
     captured: dict[str, Any] = {}
 
-    def build(config: Any, *, on_retry: Any) -> object:
-        captured.update(config=config, on_retry=on_retry)
+    def build(
+        config: Any, *, on_backoff: Any, on_retry: Any, on_exhausted: Any
+    ) -> object:
+        captured.update(
+            config=config,
+            on_backoff=on_backoff,
+            on_retry=on_retry,
+            on_exhausted=on_exhausted,
+        )
         return object()
 
     observer = lambda _: None
+    backoff_observer = lambda _: None
+    exhausted_observer = lambda _: None
     monkeypatch.setattr(provider_registry, "Gemini", build)
 
     created = create_provider(
@@ -69,7 +88,9 @@ def test_gemini_factory_maps_shared_controls(
             max_retries=0,
             max_output_tokens=128,
             thinking_budget=0,
+            on_backoff=backoff_observer,
             on_retry=observer,
+            on_exhausted=exhausted_observer,
         ),
     )
 
@@ -78,7 +99,9 @@ def test_gemini_factory_maps_shared_controls(
     assert captured["config"].max_retries == 0
     assert captured["config"].max_output_tokens == 128
     assert captured["config"].thinking_budget == 0
+    assert captured["on_backoff"] is backoff_observer
     assert captured["on_retry"] is observer
+    assert captured["on_exhausted"] is exhausted_observer
 
 
 def test_together_factory_maps_shared_controls(
@@ -86,11 +109,20 @@ def test_together_factory_maps_shared_controls(
 ) -> None:
     captured: dict[str, Any] = {}
 
-    def build(*, config: Any, on_retry: Any) -> object:
-        captured.update(config=config, on_retry=on_retry)
+    def build(
+        *, config: Any, on_backoff: Any, on_retry: Any, on_exhausted: Any
+    ) -> object:
+        captured.update(
+            config=config,
+            on_backoff=on_backoff,
+            on_retry=on_retry,
+            on_exhausted=on_exhausted,
+        )
         return object()
 
     observer = lambda _: None
+    backoff_observer = lambda _: None
+    exhausted_observer = lambda _: None
     monkeypatch.setattr(provider_registry, "Together", build)
 
     created = create_provider(
@@ -99,7 +131,9 @@ def test_together_factory_maps_shared_controls(
             model="organization/model",
             max_retries=4,
             max_output_tokens=256,
+            on_backoff=backoff_observer,
             on_retry=observer,
+            on_exhausted=exhausted_observer,
         ),
     )
 
@@ -107,7 +141,9 @@ def test_together_factory_maps_shared_controls(
     assert captured["config"].model == "organization/model"
     assert captured["config"].max_retries == 4
     assert captured["config"].max_output_tokens == 256
+    assert captured["on_backoff"] is backoff_observer
     assert captured["on_retry"] is observer
+    assert captured["on_exhausted"] is exhausted_observer
 
 
 @pytest.mark.parametrize("thinking_budget", (0, 10))

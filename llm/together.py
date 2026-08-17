@@ -20,7 +20,15 @@ from together.types.chat.completion_create_params import (
 )
 
 from .llm import LLM
-from .retry import RetryEvent, RetryPolicy, retry_with_backoff
+from .retry import (
+    BackoffEvent,
+    RetryBudget,
+    RetryEvent,
+    RetryExhaustedEvent,
+    RetryPolicy,
+    retry_after_seconds,
+    retry_with_backoff,
+)
 
 _RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 _TRANSPORT_ERRORS = (TimeoutError, ConnectionError, httpx.TransportError)
@@ -48,6 +56,10 @@ class TogetherConfig:
     retry_base_delay_seconds: float = 0.5
     retry_max_delay_seconds: float = 8.0
     max_output_tokens: int | None = None
+    timeout_seconds: float = 20.0
+    request_deadline_seconds: float = 60.0
+    retry_budget_capacity: int = 32
+    retry_budget_refill_per_second: float = 2.0
 
     @classmethod
     def from_env(cls, *, model: str | None = None) -> TogetherConfig:
@@ -67,6 +79,18 @@ class TogetherConfig:
             max_output_tokens=_env_optional_int(
                 "TOGETHER_MAX_OUTPUT_TOKENS", minimum=1
             ),
+            timeout_seconds=_env_float(
+                "TOGETHER_TIMEOUT_SECONDS", 20.0, minimum=0.001
+            ),
+            request_deadline_seconds=_env_float(
+                "TOGETHER_REQUEST_DEADLINE_SECONDS", 60.0, minimum=0.001
+            ),
+            retry_budget_capacity=_env_int(
+                "TOGETHER_RETRY_BUDGET_CAPACITY", 32, minimum=1
+            ),
+            retry_budget_refill_per_second=_env_float(
+                "TOGETHER_RETRY_BUDGET_REFILL_PER_SECOND", 2.0, minimum=0.0
+            ),
         )
 
     def __post_init__(self) -> None:
@@ -79,6 +103,22 @@ class TogetherConfig:
             base_delay_seconds=self.retry_base_delay_seconds,
             max_delay_seconds=self.retry_max_delay_seconds,
         )
+        if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be finite and positive")
+        if (
+            not math.isfinite(self.request_deadline_seconds)
+            or self.request_deadline_seconds <= 0
+        ):
+            raise ValueError("request_deadline_seconds must be finite and positive")
+        if self.retry_budget_capacity < 1:
+            raise ValueError("retry_budget_capacity must be at least 1")
+        if (
+            not math.isfinite(self.retry_budget_refill_per_second)
+            or self.retry_budget_refill_per_second < 0
+        ):
+            raise ValueError(
+                "retry_budget_refill_per_second must be finite and non-negative"
+            )
         if self.max_output_tokens is not None and self.max_output_tokens < 1:
             raise ValueError("max_output_tokens must be positive")
 
@@ -92,7 +132,9 @@ class Together(LLM):
         client: AsyncTogether | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         jitter: Callable[[float, float], float] = random.uniform,
+        on_backoff: Callable[[BackoffEvent], None] | None = None,
         on_retry: Callable[[RetryEvent], None] | None = None,
+        on_exhausted: Callable[[RetryExhaustedEvent], None] | None = None,
     ) -> None:
         if config is not None and model is not None:
             raise ValueError("pass either model or config, not both")
@@ -102,15 +144,25 @@ class Together(LLM):
             raise ValueError("TOGETHER_API_KEY must be set")
 
         # Disable SDK retries so all providers use the same observable retry layer.
-        self._client = client or AsyncTogether(api_key=api_key, max_retries=0)
+        self._client = client or AsyncTogether(
+            api_key=api_key,
+            max_retries=0,
+            timeout=self._config.timeout_seconds,
+        )
         self._retry_policy = RetryPolicy(
             max_retries=self._config.max_retries,
             base_delay_seconds=self._config.retry_base_delay_seconds,
             max_delay_seconds=self._config.retry_max_delay_seconds,
         )
+        self._retry_budget = RetryBudget(
+            capacity=self._config.retry_budget_capacity,
+            refill_rate_per_second=self._config.retry_budget_refill_per_second,
+        )
         self._sleep = sleep
         self._jitter = jitter
+        self._on_backoff = on_backoff
         self._on_retry = on_retry
+        self._on_exhausted = on_exhausted
         self._closed = False
 
     def parallelism(self) -> int:
@@ -121,9 +173,16 @@ class Together(LLM):
             "provider": "Together",
             "model": self._config.model,
             "parallelism": self._config.parallelism,
+            "timeout_seconds": self._config.timeout_seconds,
+            "timeout_scope": "per_attempt",
+            "request_deadline_seconds": self._config.request_deadline_seconds,
             "max_retries": self._config.max_retries,
             "retry_base_delay_seconds": self._config.retry_base_delay_seconds,
             "retry_max_delay_seconds": self._config.retry_max_delay_seconds,
+            "retry_budget_capacity": self._config.retry_budget_capacity,
+            "retry_budget_refill_per_second": (
+                self._config.retry_budget_refill_per_second
+            ),
             "max_output_tokens": self._config.max_output_tokens,
         }
 
@@ -150,7 +209,12 @@ class Together(LLM):
             }
             if self._config.max_output_tokens is not None:
                 request["max_tokens"] = self._config.max_output_tokens
-            return await self._client.chat.completions.create(**request)
+            # The SDK timeout controls transport inactivity; this enforces the
+            # configured wall-clock limit for the complete provider attempt.
+            return await asyncio.wait_for(
+                self._client.chat.completions.create(**request),
+                timeout=self._config.timeout_seconds,
+            )
 
         response = await retry_with_backoff(
             create_completion,
@@ -158,9 +222,14 @@ class Together(LLM):
             handled_errors=_HANDLED_ERRORS,
             is_retryable=_is_retryable,
             status_code=_status_code,
+            retry_after=retry_after_seconds,
+            retry_budget=self._retry_budget,
+            total_timeout_seconds=self._config.request_deadline_seconds,
             sleep=self._sleep,
             jitter=self._jitter,
+            on_backoff=self._on_backoff,
             on_retry=self._on_retry,
+            on_exhausted=self._on_exhausted,
         )
         input_tokens, output_tokens = _token_counts(response)
         choices = getattr(response, "choices", None) or []

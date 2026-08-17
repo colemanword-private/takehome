@@ -15,9 +15,11 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from llm import (
+    BackoffEvent,
     LLM,
     ProviderOptions,
     RetryEvent,
+    RetryExhaustedEvent,
     add_provider_arguments,
     create_provider,
 )
@@ -72,18 +74,29 @@ class LoadTestConfig:
     requests_per_second: float
     temperature: float
     warmup_requests: int = 0
+    max_pending_requests: int | None = None
 
     def __post_init__(self) -> None:
         if self.requests < 1:
             raise ValueError("requests must be at least 1")
         if self.concurrency < 1:
             raise ValueError("concurrency must be at least 1")
-        if self.requests_per_second < 0:
-            raise ValueError("requests_per_second must not be negative")
+        if (
+            not math.isfinite(self.requests_per_second)
+            or self.requests_per_second < 0
+        ):
+            raise ValueError("requests_per_second must be finite and non-negative")
         if not 0.0 <= self.temperature <= 2.0:
             raise ValueError("temperature must be between 0.0 and 2.0")
         if self.warmup_requests < 0:
             raise ValueError("warmup_requests must not be negative")
+        if self.max_pending_requests is not None and self.max_pending_requests < 1:
+            raise ValueError("max_pending_requests must be at least 1")
+
+    @property
+    def pending_request_limit(self) -> int:
+        """Bound queued work while allowing a small open-loop arrival burst."""
+        return self.max_pending_requests or self.concurrency * 4
 
 
 @dataclass(frozen=True)
@@ -98,19 +111,59 @@ class RequestSample:
     status_code: int | None = None
 
 
+@dataclass(frozen=True)
+class _PhaseResult:
+    samples: list[RequestSample]
+    queue_capacity: int
+    max_queue_depth: int
+
+
 class RetryCounter:
     def __init__(self) -> None:
+        self._backoffs: list[BackoffEvent] = []
         self._events: list[RetryEvent] = []
+        self._exhaustions: list[RetryExhaustedEvent] = []
+
+    def record_backoff(self, event: BackoffEvent) -> None:
+        self._backoffs.append(event)
 
     def record(self, event: RetryEvent) -> None:
         self._events.append(event)
 
+    def record_exhaustion(self, event: RetryExhaustedEvent) -> None:
+        self._exhaustions.append(event)
+
     def reset(self) -> None:
+        self._backoffs.clear()
         self._events.clear()
+        self._exhaustions.clear()
 
     @property
     def count(self) -> int:
         return len(self._events)
+
+    @property
+    def cumulative_backoff_seconds(self) -> float:
+        return sum(event.delay_seconds for event in self._backoffs)
+
+    @property
+    def exhaustion_count(self) -> int:
+        return len(self._exhaustions)
+
+    @property
+    def exhaustions_by_reason(self) -> dict[str, int]:
+        return dict(Counter(event.reason for event in self._exhaustions))
+
+    @property
+    def exhaustions_by_status(self) -> dict[str, int]:
+        return dict(
+            Counter(
+                str(event.status_code)
+                if event.status_code is not None
+                else event.error_type
+                for event in self._exhaustions
+            )
+        )
 
     @property
     def by_status(self) -> dict[str, int]:
@@ -155,15 +208,20 @@ async def run_load_test(
     config: LoadTestConfig,
     retry_counter: RetryCounter | None = None,
 ) -> dict[str, Any]:
-    warmup_samples: list[RequestSample] = []
+    warmup_phase = _PhaseResult(
+        samples=[],
+        queue_capacity=config.pending_request_limit,
+        max_queue_depth=0,
+    )
     if config.warmup_requests:
-        warmup_samples = await _run_phase(
+        warmup_phase = await _run_phase(
             provider,
             workload,
             requests=config.warmup_requests,
             concurrency=min(config.concurrency, config.warmup_requests),
             requests_per_second=0,
             temperature=config.temperature,
+            max_pending_requests=config.pending_request_limit,
         )
         if retry_counter is not None:
             # Warmup establishes connections but must not contaminate measured retries.
@@ -171,17 +229,18 @@ async def run_load_test(
 
     started_at = datetime.now(timezone.utc)
     phase_started = time.perf_counter()
-    samples = await _run_phase(
+    measured_phase = await _run_phase(
         provider,
         workload,
         requests=config.requests,
         concurrency=config.concurrency,
         requests_per_second=config.requests_per_second,
         temperature=config.temperature,
+        max_pending_requests=config.pending_request_limit,
     )
     elapsed_seconds = time.perf_counter() - phase_started
 
-    summary = _summarize(samples, elapsed_seconds)
+    summary = _summarize(measured_phase.samples, elapsed_seconds)
     summary.update(
         {
             "started_at": started_at.isoformat(),
@@ -189,11 +248,10 @@ async def run_load_test(
             "provider": provider.metadata(),
             "workload": workload.metadata(),
             "runtime": _runtime_metadata(),
-            "warmup": _phase_counts(warmup_samples),
-            "retries": retry_counter.count if retry_counter is not None else None,
-            "retries_by_status": (
-                retry_counter.by_status if retry_counter is not None else None
-            ),
+            "queue_capacity": measured_phase.queue_capacity,
+            "max_queue_depth": measured_phase.max_queue_depth,
+            "warmup": _phase_summary(warmup_phase),
+            **_retry_summary(retry_counter, len(measured_phase.samples)),
         }
     )
     return summary
@@ -207,9 +265,13 @@ async def _run_phase(
     concurrency: int,
     requests_per_second: float,
     temperature: float,
-) -> list[RequestSample]:
-    queue: asyncio.Queue[tuple[int, float] | None] = asyncio.Queue()
+    max_pending_requests: int,
+) -> _PhaseResult:
+    queue: asyncio.Queue[tuple[int, float] | None] = asyncio.Queue(
+        maxsize=max_pending_requests
+    )
     samples: list[RequestSample] = []
+    max_queue_depth = 0
 
     async def worker() -> None:
         while True:
@@ -255,8 +317,10 @@ async def _run_phase(
                 queue.task_done()
 
     async def produce() -> None:
+        nonlocal max_queue_depth
         # Schedule against absolute deadlines. This preserves the offered arrival rate
-        # even when service latency rises, making queue delay visible as saturation.
+        # even when service latency rises. A bounded queue applies backpressure while
+        # scheduled timestamps preserve the resulting overload as queue delay.
         phase_started = time.perf_counter()
         for index in range(requests):
             if requests_per_second:
@@ -264,7 +328,8 @@ async def _run_phase(
                 await asyncio.sleep(max(0.0, scheduled_at - time.perf_counter()))
             else:
                 scheduled_at = phase_started
-            queue.put_nowait((index, scheduled_at))
+            await queue.put((index, scheduled_at))
+            max_queue_depth = max(max_queue_depth, queue.qsize())
 
     workers = [asyncio.create_task(worker()) for _ in range(concurrency)]
     producer = asyncio.create_task(produce())
@@ -292,7 +357,7 @@ async def _run_phase(
         await join_task
 
         for _ in workers:
-            queue.put_nowait(None)
+            await queue.put(None)
         await asyncio.gather(*workers)
     finally:
         # Cancellation can occur during pacing, queue draining, or provider I/O. Always
@@ -307,7 +372,11 @@ async def _run_phase(
             if not task.done():
                 task.cancel()
         await asyncio.gather(*workers, return_exceptions=True)
-    return samples
+    return _PhaseResult(
+        samples=samples,
+        queue_capacity=max_pending_requests,
+        max_queue_depth=max_queue_depth,
+    )
 
 
 def _summarize(
@@ -360,6 +429,38 @@ def _phase_counts(samples: Sequence[RequestSample]) -> dict[str, Any]:
         "successes": len(samples) - len(failures),
         "failures": len(failures),
         "failure_modes": dict(sorted(failure_modes.items())),
+    }
+
+
+def _phase_summary(phase: _PhaseResult) -> dict[str, Any]:
+    return {
+        **_phase_counts(phase.samples),
+        "queue_capacity": phase.queue_capacity,
+        "max_queue_depth": phase.max_queue_depth,
+    }
+
+
+def _retry_summary(
+    retry_counter: RetryCounter | None, request_count: int
+) -> dict[str, Any]:
+    if retry_counter is None:
+        return {
+            "retries": None,
+            "provider_attempts": None,
+            "retry_backoff_seconds": None,
+            "retry_exhaustions": None,
+            "retry_exhaustions_by_reason": None,
+            "retry_exhaustions_by_status": None,
+            "retries_by_status": None,
+        }
+    return {
+        "retries": retry_counter.count,
+        "provider_attempts": request_count + retry_counter.count,
+        "retry_backoff_seconds": retry_counter.cumulative_backoff_seconds,
+        "retry_exhaustions": retry_counter.exhaustion_count,
+        "retry_exhaustions_by_reason": retry_counter.exhaustions_by_reason,
+        "retry_exhaustions_by_status": retry_counter.exhaustions_by_status,
+        "retries_by_status": retry_counter.by_status,
     }
 
 
@@ -427,6 +528,11 @@ def _parse_args() -> argparse.Namespace:
         help="Maximum in-flight requests (defaults to the provider suggestion).",
     )
     parser.add_argument("--warmup-requests", type=int, default=5)
+    parser.add_argument(
+        "--max-pending-requests",
+        type=int,
+        help="Maximum queued arrivals (defaults to four times concurrency).",
+    )
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument(
         "--synthetic",
@@ -459,7 +565,9 @@ async def _main() -> int:
                 max_retries=args.max_retries,
                 max_output_tokens=args.max_output_tokens,
                 thinking_budget=args.thinking_budget,
+                on_backoff=retry_counter.record_backoff,
                 on_retry=retry_counter.record,
+                on_exhausted=retry_counter.record_exhaustion,
             ),
         )
         observed_retries = retry_counter
@@ -471,6 +579,7 @@ async def _main() -> int:
             requests_per_second=args.rps,
             temperature=args.temperature,
             warmup_requests=args.warmup_requests,
+            max_pending_requests=args.max_pending_requests,
         )
         summary = await run_load_test(provider, workload, config, observed_retries)
     finally:

@@ -6,10 +6,12 @@ from typing import Callable
 
 from .gemini import Gemini, GeminiConfig, check_gemini_readiness
 from .llm import LLM
-from .retry import RetryEvent
+from .retry import BackoffEvent, RetryEvent, RetryExhaustedEvent
 from .together import Together, TogetherConfig, check_together_readiness
 
+BackoffObserver = Callable[[BackoffEvent], None]
 RetryObserver = Callable[[RetryEvent], None]
+RetryExhaustedObserver = Callable[[RetryExhaustedEvent], None]
 
 
 @dataclass(frozen=True)
@@ -21,6 +23,8 @@ class ProviderOptions:
     max_output_tokens: int | None = None
     thinking_budget: int | None = None
     on_retry: RetryObserver | None = None
+    on_backoff: BackoffObserver | None = None
+    on_exhausted: RetryExhaustedObserver | None = None
 
 
 @dataclass(frozen=True)
@@ -42,7 +46,12 @@ def _build_gemini(options: ProviderOptions) -> LLM:
         )
         if value is not None
     }
-    return Gemini(replace(config, **overrides), on_retry=options.on_retry)
+    return Gemini(
+        replace(config, **overrides),
+        on_backoff=options.on_backoff,
+        on_retry=options.on_retry,
+        on_exhausted=options.on_exhausted,
+    )
 
 
 def _build_together(options: ProviderOptions) -> LLM:
@@ -60,7 +69,9 @@ def _build_together(options: ProviderOptions) -> LLM:
     }
     return Together(
         config=replace(config, **overrides),
+        on_backoff=options.on_backoff,
         on_retry=options.on_retry,
+        on_exhausted=options.on_exhausted,
     )
 
 

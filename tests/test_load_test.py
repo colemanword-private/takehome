@@ -4,8 +4,19 @@ import asyncio
 
 import pytest
 
-from llm import LLM
-from load_test import LoadTestConfig, SyntheticProvider, Workload, run_load_test
+from llm import (
+    LLM,
+    RetryBudget,
+    RetryPolicy,
+    retry_with_backoff,
+)
+from load_test import (
+    LoadTestConfig,
+    RetryCounter,
+    SyntheticProvider,
+    Workload,
+    run_load_test,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -69,11 +80,15 @@ async def test_load_test_enforces_concurrency_and_reports_failures() -> None:
     assert len(summary["workload"]["sha256"]) == 64
     assert summary["runtime"]["dependencies"]["google-genai"] == "2.13.0"
     assert summary["retries"] is None
+    assert summary["queue_capacity"] == 12
+    assert summary["max_queue_depth"] <= summary["queue_capacity"]
     assert summary["warmup"] == {
         "requests": 0,
         "successes": 0,
         "failures": 0,
         "failure_modes": {},
+        "queue_capacity": 12,
+        "max_queue_depth": 0,
     }
 
 
@@ -182,4 +197,153 @@ async def test_warmup_requests_are_excluded_from_results() -> None:
         "successes": 2,
         "failures": 0,
         "failure_modes": {},
+        "queue_capacity": 8,
+        "max_queue_depth": 2,
     }
+
+
+async def test_pending_request_queue_applies_bounded_backpressure() -> None:
+    first_request_started = asyncio.Event()
+    release_requests = asyncio.Event()
+
+    class GatedProvider(FakeProvider):
+        async def ask_generic_question(
+            self, system_prompt: str, question: str, temperature: float
+        ) -> LLM.SimpleResponse:
+            self.calls += 1
+            first_request_started.set()
+            await release_requests.wait()
+            return LLM.SimpleResponse("ok", input_tokens=1, output_tokens=1)
+
+    provider = GatedProvider()
+    task = asyncio.create_task(
+        run_load_test(
+            provider,
+            Workload("system", ("one",)),
+            LoadTestConfig(
+                requests=20,
+                concurrency=1,
+                requests_per_second=0,
+                temperature=0.0,
+                max_pending_requests=2,
+            ),
+        )
+    )
+
+    await first_request_started.wait()
+    await asyncio.sleep(0)
+    assert provider.calls == 1
+    release_requests.set()
+    summary = await task
+
+    assert summary["requests"] == 20
+    assert summary["queue_capacity"] == 2
+    assert summary["max_queue_depth"] == 2
+
+
+async def test_queue_limit_may_be_smaller_than_worker_concurrency() -> None:
+    summary = await run_load_test(
+        FakeProvider(),
+        Workload("system", ("one",)),
+        LoadTestConfig(
+            requests=10,
+            concurrency=4,
+            requests_per_second=0,
+            temperature=0.0,
+            max_pending_requests=1,
+        ),
+    )
+
+    assert summary["successes"] == 10
+    assert summary["queue_capacity"] == 1
+    assert summary["max_queue_depth"] == 1
+
+
+async def test_load_report_includes_retry_attempt_and_exhaustion_telemetry() -> None:
+    retry_counter = RetryCounter()
+
+    class FaultingRetryProvider(LLM):
+        def __init__(self) -> None:
+            self.requests = 0
+            self.provider_calls = 0
+            self.retry_budget = RetryBudget(1, 0)
+
+        def parallelism(self) -> int:
+            return 1
+
+        async def ask_generic_question(
+            self, system_prompt: str, question: str, temperature: float
+        ) -> LLM.SimpleResponse:
+            self.requests += 1
+            request_number = self.requests
+            attempts = 0
+
+            async def operation() -> LLM.SimpleResponse:
+                nonlocal attempts
+                attempts += 1
+                self.provider_calls += 1
+                if request_number == 2 or attempts == 1:
+                    raise ServiceUnavailable("unavailable")
+                return LLM.SimpleResponse("ok", input_tokens=1, output_tokens=1)
+
+            return await retry_with_backoff(
+                operation,
+                policy=RetryPolicy(2, 0.25, 0.25),
+                handled_errors=(ServiceUnavailable,),
+                is_retryable=lambda _: True,
+                status_code=lambda error: error.code,
+                retry_budget=self.retry_budget,
+                sleep=lambda _: asyncio.sleep(0),
+                jitter=lambda _low, high: high,
+                on_backoff=retry_counter.record_backoff,
+                on_retry=retry_counter.record,
+                on_exhausted=retry_counter.record_exhaustion,
+            )
+
+    provider = FaultingRetryProvider()
+
+    summary = await run_load_test(
+        provider,
+        Workload("system", ("one",)),
+        LoadTestConfig(
+            requests=2,
+            concurrency=1,
+            requests_per_second=0,
+            temperature=0.0,
+        ),
+        retry_counter,
+    )
+
+    assert provider.provider_calls == 3
+    assert summary["successes"] == 1
+    assert summary["failures"] == 1
+    assert summary["retries"] == 1
+    assert summary["provider_attempts"] == 3
+    assert summary["retry_backoff_seconds"] == 0.5
+    assert summary["retry_exhaustions"] == 1
+    assert summary["retry_exhaustions_by_reason"] == {"retry_budget": 1}
+    assert summary["retry_exhaustions_by_status"] == {"503": 1}
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    (
+        ({"requests_per_second": float("nan")}, "requests_per_second"),
+        ({"requests_per_second": float("inf")}, "requests_per_second"),
+        ({"max_pending_requests": 0}, "max_pending_requests"),
+    ),
+)
+async def test_load_config_rejects_invalid_admission_values(
+    overrides: dict[str, float | int], message: str
+) -> None:
+    values: dict[str, float | int | None] = {
+        "requests": 1,
+        "concurrency": 1,
+        "requests_per_second": 1.0,
+        "temperature": 0.0,
+        "max_pending_requests": None,
+    }
+    values.update(overrides)
+
+    with pytest.raises(ValueError, match=message):
+        LoadTestConfig(**values)  # type: ignore[arg-type]

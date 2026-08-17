@@ -8,7 +8,14 @@ import httpx
 import pytest
 from google.genai import errors
 
-from llm import Gemini, GeminiConfig, GeminiResponseError, RetryEvent
+from llm import (
+    Gemini,
+    GeminiConfig,
+    GeminiResponseError,
+    RetryDeadlineExceeded,
+    RetryEvent,
+    RetryExhaustedEvent,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -78,6 +85,26 @@ def config(**overrides: Any) -> GeminiConfig:
     return GeminiConfig(**values)
 
 
+async def test_config_preserves_original_positional_field_order() -> None:
+    configured = GeminiConfig(
+        "project-id",
+        "us-central1",
+        "gemini-test",
+        16,
+        12.0,
+        2,
+        0.25,
+        4.0,
+        256,
+        0,
+    )
+
+    assert configured.max_retries == 2
+    assert configured.max_output_tokens == 256
+    assert configured.thinking_budget == 0
+    assert configured.request_deadline_seconds == 60.0
+
+
 async def test_maps_request_and_includes_thinking_in_output_usage() -> None:
     client = FakeClient([response()])
     provider = Gemini(
@@ -127,9 +154,15 @@ async def test_constructs_vertex_client_with_stable_api(
 
 
 async def test_retries_resource_exhausted_with_full_jitter() -> None:
+    request = httpx.Request("POST", "https://aiplatform.googleapis.com")
+    rate_limited = errors.ClientError(
+        429,
+        {"error": {"message": "busy"}},
+        httpx.Response(429, request=request, headers={"Retry-After": "1.5"}),
+    )
     client = FakeClient(
         [
-            errors.ClientError(429, {"error": {"message": "busy"}}),
+            rate_limited,
             response(),
         ]
     )
@@ -151,15 +184,36 @@ async def test_retries_resource_exhausted_with_full_jitter() -> None:
 
     assert result.answer == "answer"
     assert len(client.aio.models.calls) == 2
-    assert delays == [0.25]
+    assert delays == [1.5]
     assert retries == [
         RetryEvent(
             attempt=1,
-            delay_seconds=0.25,
+            delay_seconds=1.5,
             status_code=429,
             error_type="ClientError",
+            retry_after_seconds=1.5,
+            cumulative_backoff_seconds=1.5,
         )
     ]
+
+
+async def test_retries_service_unavailable() -> None:
+    client = FakeClient(
+        [
+            errors.ServerError(503, {"error": {"message": "unavailable"}}),
+            response(),
+        ]
+    )
+    provider = Gemini(
+        config(retry_base_delay_seconds=0, retry_max_delay_seconds=0),
+        client=client,
+        sleep=lambda _: asyncio.sleep(0),
+    )
+
+    result = await provider.ask_generic_question("system", "question", 0.0)
+
+    assert result.answer == "answer"
+    assert len(client.aio.models.calls) == 2
 
 
 async def test_does_not_retry_non_transient_client_error() -> None:
@@ -206,6 +260,58 @@ async def test_retries_provider_timeout_until_budget_is_exhausted() -> None:
         await provider.ask_generic_question("system", "question", 0.0)
 
     assert len(client.aio.models.calls) == 2
+
+
+async def test_end_to_end_deadline_bounds_repeated_timeouts() -> None:
+    async def too_slow() -> SimpleNamespace:
+        await asyncio.Event().wait()
+        return response()
+
+    exhausted: list[RetryExhaustedEvent] = []
+    client = FakeClient([too_slow])
+    provider = Gemini(
+        config(
+            timeout_seconds=1,
+            request_deadline_seconds=0.01,
+            max_retries=4,
+            retry_base_delay_seconds=0,
+        ),
+        client=client,
+        on_exhausted=exhausted.append,
+    )
+
+    with pytest.raises(RetryDeadlineExceeded) as raised:
+        await provider.ask_generic_question("system", "question", 0.0)
+
+    assert len(client.aio.models.calls) == 1
+    assert raised.value.event.reason == "deadline"
+    assert exhausted == [raised.value.event]
+
+
+async def test_shared_retry_budget_stops_repeated_transient_failures() -> None:
+    unavailable = errors.ServerError(
+        503, {"error": {"message": "unavailable"}}
+    )
+    exhausted: list[RetryExhaustedEvent] = []
+    client = FakeClient([unavailable, unavailable])
+    provider = Gemini(
+        config(
+            max_retries=4,
+            retry_base_delay_seconds=0,
+            retry_max_delay_seconds=0,
+            retry_budget_capacity=1,
+            retry_budget_refill_per_second=0,
+        ),
+        client=client,
+        sleep=lambda _: asyncio.sleep(0),
+        on_exhausted=exhausted.append,
+    )
+
+    with pytest.raises(errors.ServerError):
+        await provider.ask_generic_question("system", "question", 0.0)
+
+    assert len(client.aio.models.calls) == 2
+    assert exhausted[0].reason == "retry_budget"
 
 
 async def test_reports_blocked_or_empty_response() -> None:
@@ -274,4 +380,41 @@ async def test_environment_configuration_rejects_non_finite_delays(
     monkeypatch.setenv("GEMINI_RETRY_MAX_DELAY_SECONDS", variable)
 
     with pytest.raises(ValueError, match="GEMINI_RETRY_MAX_DELAY_SECONDS"):
+        GeminiConfig.from_env()
+
+
+async def test_environment_configures_deadline_and_retry_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "project-id")
+    monkeypatch.setenv("GEMINI_TIMEOUT_SECONDS", "12")
+    monkeypatch.setenv("GEMINI_REQUEST_DEADLINE_SECONDS", "45")
+    monkeypatch.setenv("GEMINI_RETRY_BUDGET_CAPACITY", "20")
+    monkeypatch.setenv("GEMINI_RETRY_BUDGET_REFILL_PER_SECOND", "1.5")
+
+    configured = GeminiConfig.from_env()
+
+    assert configured.timeout_seconds == 12
+    assert configured.request_deadline_seconds == 45
+    assert configured.retry_budget_capacity == 20
+    assert configured.retry_budget_refill_per_second == 1.5
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    (
+        ("GEMINI_REQUEST_DEADLINE_SECONDS", "0"),
+        ("GEMINI_RETRY_BUDGET_CAPACITY", "0"),
+        ("GEMINI_RETRY_BUDGET_REFILL_PER_SECOND", "nan"),
+    ),
+)
+async def test_environment_rejects_invalid_hardening_controls(
+    monkeypatch: pytest.MonkeyPatch,
+    variable: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "project-id")
+    monkeypatch.setenv(variable, value)
+
+    with pytest.raises(ValueError, match=variable):
         GeminiConfig.from_env()

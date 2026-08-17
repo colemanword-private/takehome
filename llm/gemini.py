@@ -15,7 +15,15 @@ from google.auth import exceptions as google_auth_exceptions
 from google.genai import errors, types
 
 from .llm import LLM
-from .retry import RetryEvent, RetryPolicy, retry_with_backoff
+from .retry import (
+    BackoffEvent,
+    RetryBudget,
+    RetryEvent,
+    RetryExhaustedEvent,
+    RetryPolicy,
+    retry_after_seconds,
+    retry_with_backoff,
+)
 
 # Retrying other 4xx responses would amplify permanent configuration or prompt errors.
 _RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
@@ -47,12 +55,15 @@ class GeminiConfig:
     location: str = "global"
     model: str = "gemini-2.5-flash"
     parallelism: int = 32
-    timeout_seconds: float = 60.0
+    timeout_seconds: float = 20.0
     max_retries: int = 4
     retry_base_delay_seconds: float = 0.5
     retry_max_delay_seconds: float = 8.0
     max_output_tokens: int | None = None
     thinking_budget: int | None = None
+    request_deadline_seconds: float = 60.0
+    retry_budget_capacity: int = 32
+    retry_budget_refill_per_second: float = 2.0
 
     @classmethod
     def from_env(cls) -> GeminiConfig:
@@ -66,7 +77,10 @@ class GeminiConfig:
             model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
             parallelism=_env_int("GEMINI_PARALLELISM", 32, minimum=1),
             timeout_seconds=_env_float(
-                "GEMINI_TIMEOUT_SECONDS", 60.0, minimum=0.001
+                "GEMINI_TIMEOUT_SECONDS", 20.0, minimum=0.001
+            ),
+            request_deadline_seconds=_env_float(
+                "GEMINI_REQUEST_DEADLINE_SECONDS", 60.0, minimum=0.001
             ),
             max_retries=_env_int("GEMINI_MAX_RETRIES", 4, minimum=0),
             retry_base_delay_seconds=_env_float(
@@ -74,6 +88,12 @@ class GeminiConfig:
             ),
             retry_max_delay_seconds=_env_float(
                 "GEMINI_RETRY_MAX_DELAY_SECONDS", 8.0, minimum=0.0
+            ),
+            retry_budget_capacity=_env_int(
+                "GEMINI_RETRY_BUDGET_CAPACITY", 32, minimum=1
+            ),
+            retry_budget_refill_per_second=_env_float(
+                "GEMINI_RETRY_BUDGET_REFILL_PER_SECOND", 2.0, minimum=0.0
             ),
             max_output_tokens=_env_optional_int(
                 "GEMINI_MAX_OUTPUT_TOKENS", minimum=1
@@ -94,6 +114,11 @@ class GeminiConfig:
             raise ValueError("parallelism must be at least 1")
         if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be finite and positive")
+        if (
+            not math.isfinite(self.request_deadline_seconds)
+            or self.request_deadline_seconds <= 0
+        ):
+            raise ValueError("request_deadline_seconds must be finite and positive")
         if self.max_retries < 0:
             raise ValueError("max_retries must not be negative")
         if (
@@ -108,6 +133,15 @@ class GeminiConfig:
         if self.retry_max_delay_seconds < self.retry_base_delay_seconds:
             raise ValueError(
                 "retry_max_delay_seconds must be at least retry_base_delay_seconds"
+            )
+        if self.retry_budget_capacity < 1:
+            raise ValueError("retry_budget_capacity must be at least 1")
+        if (
+            not math.isfinite(self.retry_budget_refill_per_second)
+            or self.retry_budget_refill_per_second < 0
+        ):
+            raise ValueError(
+                "retry_budget_refill_per_second must be finite and non-negative"
             )
         if self.max_output_tokens is not None and self.max_output_tokens < 1:
             raise ValueError("max_output_tokens must be positive")
@@ -125,17 +159,25 @@ class Gemini(LLM):
         client: Any | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         jitter: Callable[[float, float], float] = random.uniform,
+        on_backoff: Callable[[BackoffEvent], None] | None = None,
         on_retry: Callable[[RetryEvent], None] | None = None,
+        on_exhausted: Callable[[RetryExhaustedEvent], None] | None = None,
     ) -> None:
         self._config = config or GeminiConfig.from_env()
         self._sleep = sleep
         self._jitter = jitter
+        self._on_backoff = on_backoff
         self._on_retry = on_retry
+        self._on_exhausted = on_exhausted
         self._closed = False
         self._retry_policy = RetryPolicy(
             max_retries=self._config.max_retries,
             base_delay_seconds=self._config.retry_base_delay_seconds,
             max_delay_seconds=self._config.retry_max_delay_seconds,
+        )
+        self._retry_budget = RetryBudget(
+            capacity=self._config.retry_budget_capacity,
+            refill_rate_per_second=self._config.retry_budget_refill_per_second,
         )
 
         # Construct one SDK client per provider so concurrent calls share its
@@ -168,9 +210,15 @@ class Gemini(LLM):
             "model": self._config.model,
             "parallelism": self._config.parallelism,
             "timeout_seconds": self._config.timeout_seconds,
+            "timeout_scope": "per_attempt",
+            "request_deadline_seconds": self._config.request_deadline_seconds,
             "max_retries": self._config.max_retries,
             "retry_base_delay_seconds": self._config.retry_base_delay_seconds,
             "retry_max_delay_seconds": self._config.retry_max_delay_seconds,
+            "retry_budget_capacity": self._config.retry_budget_capacity,
+            "retry_budget_refill_per_second": (
+                self._config.retry_budget_refill_per_second
+            ),
             "max_output_tokens": self._config.max_output_tokens,
             "thinking_budget": self._config.thinking_budget,
         }
@@ -264,9 +312,14 @@ class Gemini(LLM):
             handled_errors=_HANDLED_ERRORS,
             is_retryable=_is_retryable,
             status_code=_status_code,
+            retry_after=retry_after_seconds,
+            retry_budget=self._retry_budget,
+            total_timeout_seconds=self._config.request_deadline_seconds,
             sleep=self._sleep,
             jitter=self._jitter,
+            on_backoff=self._on_backoff,
             on_retry=self._on_retry,
+            on_exhausted=self._on_exhausted,
         )
 
 

@@ -33,7 +33,9 @@ SYNTHETIC_RESULTS_DIR ?= $(LOAD_RESULTS_ROOT)/synthetic/local/$(RUN_ID)
 TEMPERATURE ?= 0
 MAX_OUTPUT_TOKENS ?= 256
 THINKING_BUDGET ?=
+MAX_PENDING_REQUESTS ?=
 THINKING_BUDGET_ARG = $(if $(strip $(THINKING_BUDGET)),--thinking-budget "$(THINKING_BUDGET)")
+MAX_PENDING_REQUESTS_ARG = $(if $(strip $(MAX_PENDING_REQUESTS)),--max-pending-requests "$(MAX_PENDING_REQUESTS)")
 PROVIDER_CONTROL_ARGS = \
 	--max-output-tokens "$(MAX_OUTPUT_TOKENS)" \
 	$(THINKING_BUDGET_ARG)
@@ -90,6 +92,7 @@ help:
 		'Useful overrides:' \
 		'  RAMP_RPS="1 3 5" RAMP_CONCURRENCY=96 RAMP_DURATION_SECONDS=300' \
 		'  MAX_OUTPUT_TOKENS=1024 THINKING_BUDGET=512 TEMPERATURE=0' \
+		'  MAX_PENDING_REQUESTS=256  Bound queued load-test arrivals.' \
 		'  RUN_ID=20260816T222927Z  Reuse one run directory across invocations.' \
 		'' \
 		'Results use <root>/<provider>/<model>/<RUN_ID>/ (synthetic uses synthetic/local).' \
@@ -136,6 +139,7 @@ synthetic-smoke: check-python prepare-results
 		--requests 10000 \
 		--rps 0 \
 		--concurrency 128 \
+		$(MAX_PENDING_REQUESTS_ARG) \
 		--warmup-requests 0 \
 		--temperature "$(TEMPERATURE)" \
 		--output "$(SYNTHETIC_RESULTS_DIR)/00-synthetic-smoke.json"
@@ -152,6 +156,7 @@ provider-smoke: check-provider prepare-results
 		--requests 1 \
 		--rps 1 \
 		--concurrency 1 \
+		$(MAX_PENDING_REQUESTS_ARG) \
 		--warmup-requests 0 \
 		--temperature "$(TEMPERATURE)" \
 		--output "$(LOAD_RESULTS_DIR)/01-$(PROVIDER)-smoke.json"
@@ -199,6 +204,7 @@ capacity-ramp: check-provider prepare-results
 			--requests "$$requests" \
 			--rps "$$rps" \
 			--concurrency "$(RAMP_CONCURRENCY)" \
+			$(MAX_PENDING_REQUESTS_ARG) \
 			--warmup-requests 5 \
 			--temperature "$(TEMPERATURE)" \
 			--output "$$output"; \
@@ -221,6 +227,7 @@ retry-off: check-provider prepare-results
 		--requests "$$requests" \
 		--rps "$(RETRY_RPS)" \
 		--concurrency "$(RETRY_CONCURRENCY)" \
+		$(MAX_PENDING_REQUESTS_ARG) \
 		--warmup-requests 5 \
 		--temperature "$(TEMPERATURE)" \
 		--output "$(LOAD_RESULTS_DIR)/05-$(PROVIDER)-retry-off-$(RETRY_RPS)rps.json"
@@ -242,6 +249,7 @@ retry-on: check-provider prepare-results
 		--requests "$$requests" \
 		--rps "$(RETRY_RPS)" \
 		--concurrency "$(RETRY_CONCURRENCY)" \
+		$(MAX_PENDING_REQUESTS_ARG) \
 		--warmup-requests 5 \
 		--temperature "$(TEMPERATURE)" \
 		--output "$(LOAD_RESULTS_DIR)/06-$(PROVIDER)-retry-on-$(RETRY_RPS)rps.json"
@@ -263,6 +271,7 @@ soak: check-provider prepare-results
 		--requests "$$requests" \
 		--rps "$(SOAK_RPS)" \
 		--concurrency "$(SOAK_CONCURRENCY)" \
+		$(MAX_PENDING_REQUESTS_ARG) \
 		--warmup-requests 5 \
 		--temperature "$(TEMPERATURE)" \
 		--output "$(LOAD_RESULTS_DIR)/07-$(PROVIDER)-soak-$(SOAK_RPS)rps.json"

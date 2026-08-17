@@ -89,3 +89,24 @@ def test_thinking_control_is_rendered_only_when_requested() -> None:
 
     assert result.returncode == 0, result.stderr
     assert '--thinking-budget "0"' in result.stdout
+
+
+def test_pending_request_limit_is_rendered_when_requested() -> None:
+    result = subprocess.run(
+        [
+            "make",
+            "-n",
+            "capacity-ramp",
+            "PROVIDER=gemini",
+            "MODEL=gemini-test",
+            "MAX_PENDING_REQUESTS=256",
+            "RUN_ID=dry-run",
+        ],
+        cwd=PROJECT_DIR,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert '--max-pending-requests "256"' in result.stdout
