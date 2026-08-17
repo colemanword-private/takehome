@@ -44,6 +44,13 @@ PROVIDER_CONTROL_ARGS = \
 RAMP_RPS ?= 1 3 5 8 10
 RAMP_DURATION_SECONDS ?= 60
 RAMP_CONCURRENCY ?= 160
+# Cost and safety rails for the knee search. The ramp stops cleanly once the
+# measured-request budget is spent (the last stage is truncated to fit; the five
+# warmups per stage are not counted), and the first stage breaching either
+# threshold aborts the run. Set RAMP_REQUEST_BUDGET empty for an unbounded ramp.
+RAMP_REQUEST_BUDGET ?= 20000
+RAMP_MAX_FAILURE_RATE ?= 0.01
+RAMP_MAX_P95_MS ?= 5000
 
 # Set these only after the capacity ramp identifies a candidate operating point.
 RETRY_RPS ?=
@@ -91,6 +98,10 @@ help:
 		'' \
 		'Useful overrides:' \
 		'  RAMP_RPS="1 3 5" RAMP_CONCURRENCY=96 RAMP_DURATION_SECONDS=300' \
+		'  RAMP_REQUEST_BUDGET=20000  Stop the ramp once this many measured' \
+		'                             requests are spent (empty = unbounded).' \
+		'  RAMP_MAX_FAILURE_RATE=0.01 RAMP_MAX_P95_MS=5000  Abort the ramp at' \
+		'                             the first stage breaching either threshold.' \
 		'  MAX_OUTPUT_TOKENS=1024 THINKING_BUDGET=512 TEMPERATURE=0' \
 		'  MAX_PENDING_REQUESTS=256  Bound queued load-test arrivals.' \
 		'  RUN_ID=20260816T222927Z  Reuse one run directory across invocations.' \
@@ -192,25 +203,41 @@ quality-controlled: check-provider prepare-results
 		--output "$(EVAL_RESULTS_DIR)/03-$(PROVIDER)-quality-controlled.json"
 
 # BILLABLE: step through RAMP_RPS for RAMP_DURATION_SECONDS per stage, with five
-# warmups and retries disabled. Stop at the first failed stage and inspect its report.
+# warmups and retries disabled. The run ends at the first stage breaching
+# RAMP_MAX_FAILURE_RATE or RAMP_MAX_P95_MS, or cleanly once RAMP_REQUEST_BUDGET
+# is spent; inspect the last stage's report either way.
 capacity-ramp: check-provider prepare-results
 	@set -eu; \
 	$(LOAD_PROVIDER_ENV) \
+	remaining="$(strip $(RAMP_REQUEST_BUDGET))"; \
 	for rps in $(RAMP_RPS); do \
 		requests=$$((rps * $(RAMP_DURATION_SECONDS))); \
+		if [ -n "$$remaining" ]; then \
+			if [ "$$remaining" -le 0 ]; then \
+				echo "Stopping: RAMP_REQUEST_BUDGET exhausted before the $$rps RPS stage." >&2; \
+				break; \
+			fi; \
+			if [ "$$requests" -gt "$$remaining" ]; then requests="$$remaining"; fi; \
+			remaining=$$((remaining - requests)); \
+		fi; \
 		output="$(LOAD_RESULTS_DIR)/04-$(PROVIDER)-capacity-$${rps}rps.json"; \
 		echo "Running $$requests requests against $(PROVIDER) at $$rps RPS..."; \
 		"$(PYTHON)" "$(PROJECT_DIR)/load_test.py" \
 			$(PROVIDER_ARGS) \
 			$(PROVIDER_CONTROL_ARGS) \
 			--max-retries 0 \
+			--max-failure-rate "$(RAMP_MAX_FAILURE_RATE)" \
+			--max-service-p95-ms "$(RAMP_MAX_P95_MS)" \
 			--requests "$$requests" \
 			--rps "$$rps" \
 			--concurrency "$(RAMP_CONCURRENCY)" \
 			$(MAX_PENDING_REQUESTS_ARG) \
 			--warmup-requests 5 \
 			--temperature "$(TEMPERATURE)" \
-			--output "$$output"; \
+			--output "$$output" || { \
+				echo "Stopping: the $$rps RPS stage breached the abort criterion; see $$output." >&2; \
+				exit 1; \
+			}; \
 	done
 
 # BILLABLE: measure RETRY_RPS with retries disabled to establish the unamplified

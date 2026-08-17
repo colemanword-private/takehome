@@ -135,6 +135,59 @@ def test_quality_runs_controlled_eval_even_when_baseline_fails() -> None:
     assert combined.count("Python environment is missing") == 2, combined
 
 
+def test_capacity_ramp_renders_abort_thresholds() -> None:
+    result = subprocess.run(
+        [
+            "make",
+            "-n",
+            "capacity-ramp",
+            "PROVIDER=gemini",
+            "MODEL=gemini-test",
+            "RUN_ID=dry-run",
+        ],
+        cwd=PROJECT_DIR,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert '--max-failure-rate "0.01"' in result.stdout
+    assert '--max-service-p95-ms "5000"' in result.stdout
+
+
+def test_capacity_ramp_enforces_the_total_request_budget() -> None:
+    # With a 40-request budget and 30-second stages, the 1 RPS stage uses 30,
+    # the 2 RPS stage is truncated to the remaining 10, and the 3 RPS stage
+    # never runs. Budget exhaustion is a clean stop, not an error.
+    true_path = shutil.which("true")
+    assert true_path is not None
+
+    result = subprocess.run(
+        [
+            "make",
+            "capacity-ramp",
+            f"PYTHON={true_path}",
+            "PROVIDER=gemini",
+            "RUN_ID=budget-dry-run",
+            "RAMP_RPS=1 2 3",
+            "RAMP_DURATION_SECONDS=30",
+            "RAMP_REQUEST_BUDGET=40",
+        ],
+        cwd=PROJECT_DIR,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert "Running 30 requests against gemini at 1 RPS" in result.stdout
+    assert "Running 10 requests against gemini at 2 RPS" in result.stdout
+    assert "at 3 RPS" not in result.stdout
+    assert "RAMP_REQUEST_BUDGET exhausted" in combined
+
+
 def test_pending_request_limit_is_rendered_when_requested() -> None:
     result = subprocess.run(
         [

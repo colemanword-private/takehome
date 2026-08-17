@@ -536,6 +536,22 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument(
+        "--max-failure-rate",
+        type=float,
+        help=(
+            "Abort threshold: exit nonzero when the measured failure rate "
+            "exceeds this fraction (default: any failure aborts)."
+        ),
+    )
+    parser.add_argument(
+        "--max-service-p95-ms",
+        type=float,
+        help=(
+            "Abort threshold: exit nonzero when measured service p95 exceeds "
+            "this many milliseconds."
+        ),
+    )
+    parser.add_argument(
         "--synthetic",
         action="store_true",
         help="Exercise only the local harness; does not call an LLM provider.",
@@ -547,7 +563,12 @@ def _parse_args() -> argparse.Namespace:
         default=Path(__file__).with_name("load_test_workload.json"),
     )
     parser.add_argument("--output", type=Path)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.max_failure_rate is not None and not 0.0 <= args.max_failure_rate <= 1.0:
+        parser.error("--max-failure-rate must be between 0 and 1")
+    if args.max_service_p95_ms is not None and args.max_service_p95_ms <= 0:
+        parser.error("--max-service-p95-ms must be positive")
+    return args
 
 
 async def _main() -> int:
@@ -603,13 +624,60 @@ async def _main() -> int:
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(f"{rendered}\n", encoding="utf-8")
-    return _exit_code(summary)
+    reasons = _abort_reasons(
+        summary,
+        max_failure_rate=args.max_failure_rate,
+        max_service_p95_ms=args.max_service_p95_ms,
+    )
+    for reason in reasons:
+        print(f"abort: {reason}", file=sys.stderr)
+    return 1 if reasons else 0
 
 
-def _exit_code(summary: dict[str, Any]) -> int:
+def _abort_reasons(
+    summary: dict[str, Any],
+    *,
+    max_failure_rate: float | None = None,
+    max_service_p95_ms: float | None = None,
+) -> list[str]:
     # Warmup failures stay visible in the report but must not abort a campaign
-    # whose measured phase is healthy.
-    return 1 if summary["failures"] else 0
+    # whose measured phase is healthy. A failure-rate threshold replaces the
+    # default any-failure rule so ramp stages can tolerate rare blips.
+    reasons = []
+    failures = summary["failures"]
+    if max_failure_rate is None:
+        if failures:
+            reasons.append(f"{failures} measured request(s) failed")
+    else:
+        requests = summary["requests"]
+        failure_rate = failures / requests if requests else 0.0
+        if failure_rate > max_failure_rate:
+            reasons.append(
+                f"measured failure rate {failure_rate:.4f} exceeds "
+                f"{max_failure_rate}"
+            )
+    if max_service_p95_ms is not None:
+        service_p95_ms = summary["service_latency_ms"]["p95"]
+        if service_p95_ms > max_service_p95_ms:
+            reasons.append(
+                f"service p95 {service_p95_ms:.3f} ms exceeds "
+                f"{max_service_p95_ms} ms"
+            )
+    return reasons
+
+
+def _exit_code(
+    summary: dict[str, Any],
+    *,
+    max_failure_rate: float | None = None,
+    max_service_p95_ms: float | None = None,
+) -> int:
+    reasons = _abort_reasons(
+        summary,
+        max_failure_rate=max_failure_rate,
+        max_service_p95_ms=max_service_p95_ms,
+    )
+    return 1 if reasons else 0
 
 if __name__ == "__main__":
     raise SystemExit(asyncio.run(_main()))

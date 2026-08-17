@@ -430,6 +430,79 @@ async def test_exit_code_ignores_warmup_failures_when_measured_phase_is_healthy(
     assert load_test_module._exit_code(failed_measured) == 1
 
 
+async def test_exit_code_applies_configurable_abort_thresholds() -> None:
+    import load_test as load_test_module
+
+    tolerable = {
+        "requests": 300,
+        "failures": 1,
+        "warmup": {"failures": 0},
+        "service_latency_ms": {"p95": 1200.0},
+    }
+    breaching_rate = {**tolerable, "failures": 4}
+    breaching_p95 = {**tolerable, "failures": 0}
+
+    # Default: any measured failure aborts.
+    assert load_test_module._exit_code(tolerable) == 1
+    # A 1% threshold tolerates 1/300 but aborts at 4/300 (>1.3%).
+    assert load_test_module._exit_code(tolerable, max_failure_rate=0.01) == 0
+    assert load_test_module._exit_code(breaching_rate, max_failure_rate=0.01) == 1
+    # The p95 threshold aborts independently of the failure rate.
+    assert (
+        load_test_module._exit_code(
+            breaching_p95, max_failure_rate=0.01, max_service_p95_ms=5000.0
+        )
+        == 0
+    )
+    assert (
+        load_test_module._exit_code(breaching_p95, max_service_p95_ms=1000.0) == 1
+    )
+
+
+async def test_cli_aborts_when_service_p95_exceeds_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import load_test as load_test_module
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "load_test.py",
+            "--synthetic",
+            "--requests",
+            "5",
+            "--rps",
+            "0",
+            "--concurrency",
+            "2",
+            "--warmup-requests",
+            "0",
+            "--max-service-p95-ms",
+            "0.0001",
+        ],
+    )
+
+    assert await load_test_module._main() == 1
+    assert "abort:" in capsys.readouterr().err
+
+
+async def test_cli_rejects_out_of_range_failure_rate_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import load_test as load_test_module
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["load_test.py", "--synthetic", "--max-failure-rate", "1.5"],
+    )
+
+    with pytest.raises(SystemExit):
+        await load_test_module._main()
+    assert "between 0 and 1" in capsys.readouterr().err
+
+
 async def test_cli_rejects_explicit_zero_concurrency(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
