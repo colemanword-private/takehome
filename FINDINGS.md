@@ -48,16 +48,15 @@ timeout, 60 s end-to-end deadline.
 | Single-process | `20260817T062702Z` | One event loop, concurrency 96–512 |
 | Multi-process | `20260817T155149Z` | 4–8 shard processes × 128 workers, 10-core host |
 
-Each shard of the multi-process generator is the unmodified single-process
-harness; an orchestrator (`multi_load.py`) plans per-shard rates and merges
-**raw per-request samples** into pooled percentiles (shard percentile
-summaries are never averaged). A stage only counts as a provider observation
-if every shard's scheduler-lag p95 stayed in single-digit milliseconds; shard
-arrival overlap ran 90–99%. Acceptance rails throughout: >1% failures,
-service p95 > 5 s, or end-to-end p95 > 5 s.
+The multi-process generator is simply N copies of the single-process harness
+running as separate OS processes, each pacing an equal share of the target
+rate; `multi_load.py` only launches them and merges their results. The merge
+pools the **raw per-request timings** from every shard and recomputes
+percentiles over the combined set. Every stage ran under the same
+acceptance rails: fail if more than 1% of requests fail, or if service or
+end-to-end p95 exceeds 5 s.
 
-The workload is five short marketing-assistant questions, SHA-256
-`ea8a690cb6b3d4189e403cd279a0628d12e20c2d247963b00c2fd0f2b979799a`. Combined,
+The workload is five short marketing-assistant questions. Combined,
 the campaigns issued ~167,000 measured live requests for **$10.98 at list
 prices** (a lower bound; failed attempts may not return usage metadata).
 
@@ -65,17 +64,34 @@ Thirty-five offline tests pass in ~5 s (provider behavior,
 retry/timeout/budget semantics, open-loop scheduling, shard merging and
 sibling reaping, campaign isolation, evidence redaction, cost arithmetic),
 and a synthetic two-shard run exercises the orchestrator through real
-subprocesses. Live
-one-request smokes preceded each campaign's billable stages. Developer ADC
-emitted Google's no-quota-project warning both days; production identity and
-explicit quota ownership remain required.
+subprocesses. Live one-request smokes preceded each campaign's billable stages.
 
 ## Output quality: 2×2 factorial
 
-The factorial varies thinking {model default, 0} and output cap {none, 256},
-three repeats per cell, against the ten-case deterministic dataset (v2,
-SHA-256 `ce990b305480357f887dc6fdf4cbc5a6e6e596af25a4850818bdf2cff443c6a5`).
-The table shows the first campaign.
+The quality experiment tests all four combinations of two settings —
+thinking (model default vs. explicitly disabled) and output cap (none vs.
+256 tokens) — because problems can hide in the interaction between settings
+rather than in either one alone. Each combination ran three times, so a
+failure must reproduce before it counts as real. Every run scores the same
+ten fixed prompts with mechanical pass/fail validators at temperature 0 (no
+human or LLM judging; dataset v2, SHA-256
+`ce990b305480357f887dc6fdf4cbc5a6e6e596af25a4850818bdf2cff443c6a5`). The
+table shows the first campaign, one row per configuration:
+
+- **Thinking** — the `thinking_budget` setting: `0` disables the model's
+  hidden reasoning entirely; `default` lets the model decide how much to
+  reason before answering.
+- **Output cap** — the `max_output_tokens` limit: `none` leaves it unset,
+  `256` hard-caps the response. Hidden thought tokens count against this
+  cap — that is the interaction under test.
+- **Passed by repeat** — cases passed out of ten, listed separately for
+  each of the configuration's three repeats.
+- **Time/run** — wall-clock time to score all ten cases once (the range
+  across the three repeats).
+- **Output tokens/run** — billable output tokens for one full ten-case run,
+  including hidden thought tokens.
+- **Thought tokens/run** — the hidden-reasoning share of those output
+  tokens: never visible in any answer, but billed at the output rate.
 
 | Thinking | Output cap | Passed by repeat | Time/run | Output tokens/run | Thought tokens/run |
 | --- | --- | --- | ---: | ---: | ---: |
@@ -84,24 +100,51 @@ The table shows the first campaign.
 | default | 256 | **9/10, 9/10, 9/10** | 4.29–5.10 s | 1,429–1,445 | 1,349–1,365 |
 | default | none | 10/10, 9/10, 10/10 | 6.64–7.03 s | 1,864–2,094 | 1,769–2,003 |
 
-Default thinking plus the 256-token cap reproducibly failed
-`campaign-summary-001` — 241 of its 252 output tokens were hidden thoughts —
-in all three repeats of *both* campaigns, while thinking-off cells passed
-120/120 across the two days. (One day-1 default-thinking/no-cap repeat
-failed on a transport `ConnectError` — the evaluator failing closed, not a
-quality regression; day 2 had no transport errors.) Operational rule: **a
-tight `max_output_tokens` requires an explicit thinking budget** — zero for
-this workload.
+With default thinking and the 256-token cap, the same test case
+(`campaign-summary-001`) failed in all six repeats across both days. The
+token counts show why: the model spent 241 of the case's 252 output tokens
+on hidden reasoning, leaving too little budget for the visible answer, which
+then omitted required facts. With thinking disabled, every case passed —
+120 of 120 across the two days — at a fraction of the token cost. One
+run (default thinking, no cap) failed on a network error rather than a
+wrong answer; the evaluator deliberately counts such errors as failures
+instead of hiding them, so that entry reflects transport flakiness, not
+model quality. The operational rule that falls out: **never set a tight
+`max_output_tokens` without also setting an explicit thinking budget** —
+zero for this workload.
 
 ## Multi-process bracket: the 150–300 RPS region, resolved
 
-The original single-process ramp was clean through a realized 150 RPS
+The original single-process ramp was clean through a delivered 150 RPS
 (service p95 925 ms) but collapsed at the 200-RPS target with 80-second
 scheduler lag — the event loop fell behind, not Vertex. The sharded rerun
 (four shards, 30 s stages, retries off) settles what the provider does in
-that region; "worst shard sched p95" is the client-cleanliness proof.
+that region.
 
-| Target RPS | Realized | Overlap | Requests | Failures | Service p50/p95/p99 | Worst shard sched p95 |
+Reading the table — each row is one 30-second stage, pooled across all four
+shards:
+
+- **Offered RPS** — the arrival schedule the generator was configured to
+  produce for that stage.
+- **Delivered RPS** — the arrival rate it measurably emitted. Offered and
+  Delivered must roughly match for a row to say anything about Vertex; a
+  large gap means the generator, not the provider, was the limit.
+- **Overlap** — the fraction of the stage during which all four shards were
+  emitting simultaneously. Shards are separate processes that start moments
+  apart, and the aggregate rate only exists while all of them are running;
+  high overlap means the full rate was actually offered for essentially the
+  whole stage.
+- **Requests / Failures** — completed requests across all shards, and how
+  many ended in an error (with the HTTP status behind each failure).
+- **Service p50/p95/p99** — provider call latency (request sent to full
+  response received, excluding any client-side queueing), as percentiles
+  over the pooled raw samples of every request in the stage.
+- **Worst shard sched p95** — the slowest shard's scheduler lag: how late
+  requests left the generator relative to their ideal schedule. Single-digit
+  milliseconds proves every shard kept pace, so the latency columns describe
+  the provider rather than an overloaded client.
+
+| Offered RPS | Delivered RPS | Overlap | Requests | Failures | Service p50/p95/p99 | Worst shard sched p95 |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 150 | 147.5 | 96.5% | 4,500 | 1 (`429`) | 673/1,130/1,794 ms | 1.13 ms |
 | 200 | 196.2 | 96.1% | 6,000 | 0 | 649/1,142/1,770 ms | 1.16 ms |
@@ -117,12 +160,22 @@ tracking in production, not a function of offered rate.
 
 ## Above the bracket: 400–600 RPS, burst and sustained
 
-Eight shards; the 600-RPS ceiling is a deliberate cap on a shared project,
-not a technical limit. The first three rows are 30-second probe stages with
-retries off; the last two are 60-second sustained runs with production
-retries and no rails (observational).
+Eight shards this time; the 600-RPS ceiling is a deliberate cap on a shared
+project, not a technical limit. Each row is one stage, pooled across all
+eight shards:
 
-| Target RPS | Design | Realized | Requests | Failures | Retries | Service p50/p95 | Worst shard sched p95 |
+- **Offered RPS, Delivered RPS, Requests, Failures, Worst shard sched p95**
+  — same meanings as in the bracket table.
+- **Design** — the stage's shape: "burst" rows are 30-second probe stages
+  with retries disabled so raw failure rates stay visible; "sustained" rows
+  are 60-second runs under the production retry policy, with no acceptance
+  rails (observational).
+- **Retries** — retry attempts made under that policy ("off" where retries
+  were disabled). In both sustained rows every retried request recovered on
+  its first retry, which is why Failures stays zero.
+- **Service p50/p95** — as in the bracket table; p99 omitted for width.
+
+| Offered RPS | Design | Delivered RPS | Requests | Failures | Retries | Service p50/p95 | Worst shard sched p95 |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | 400 | 30 s burst | 389.4 | 12,000 | 0 | off | 724/1,332 ms | 9.41 ms |
 | 500 | 30 s burst | 489.2 | 15,000 | 27 (23×`499`, 4×`504`) | off | 706/1,361 ms | 1.10 ms |
@@ -131,8 +184,9 @@ retries and no rails (observational).
 | 600 | 60 s sustained | 408.0 | 36,000 | 0 | 5 (1×`429`, 4×transport) | 792/**8,864** ms | 37,261 ms |
 
 - **No throttling up to 600 RPS burst** — 25× the pilot — and no 429 at any
-  probe rate. Under spend-tiered shared capacity that is good weather, not a
-  guarantee; a capacity commitment needs Provisioned Throughput.
+  probe rate. Because capacity is shared and spend-tiered, that reflects
+  favorable conditions during the test, not a guarantee; a capacity
+  commitment needs Provisioned Throughput.
 - **Vertex returns HTTP 499 (`CANCELLED`) sporadically at ≥500 RPS**, a
   status absent from the retry policy's retryable set (408/429/5xx). At
   ~0.17% it barely matters, but production should decide 499 handling
@@ -141,7 +195,7 @@ retries and no rails (observational).
   end-to-end p95 equals service p95 (no queueing) and all five 504s were
   absorbed by one retry each. Sustained 600 completed all 36,000 requests but
   degraded — service p95 8.9 s, end-to-end p95 42.8 s, 128-worker shards
-  saturated, realized rate 408. The same rate was clean for 30 s, so the
+  saturated, delivered rate 408. The same rate was clean for 30 s, so the
   degradation develops under sustained load; with one host I cannot fully
   separate provider pushback from client limits, but either way **beyond
   ~300 RPS sustained this configuration degrades through latency at zero
@@ -173,61 +227,67 @@ observed usage.
 
 ## Design decisions and tradeoffs
 
-- The orchestrator shards the *tested* harness rather than introducing a new
-  load tool; only raw samples cross the process boundary, and a failed or
-  interrupted run terminates and reaps every sibling shard so nothing keeps
-  billing unsupervised.
-- Merged reports publish the shard arrival-overlap fraction so aggregate-rate
-  claims are measured, not assumed; bounded stage lists and the 600-RPS
-  ceiling cap spend and aggression on a shared project (~126k of a
-  250k-request budget used).
-- Ramp, bracket, and probe keep retries off so raw failure rates stay
-  visible; operating-point and sustained runs use production retry settings.
-- Committed evidence is generated, redacted, and hashed: per-source SHA-256s
-  (including each merged stage's raw shard reports), numeric aggregates,
-  retry breakdowns, and effective configuration — no prompts, outputs, error
-  messages, or project identifiers. Stage artifacts are never overwritten
-  and the summary rejects shard sets that don't match their merged report,
-  so a reused RUN_ID cannot mix campaigns. (An earlier revision also
-  validated campaign shape; it cost more review surface than the risk it
-  defended against and was cut.)
+- **Reuse the tested harness for multi-process load.** Each shard is the
+  same single-process generator the test suite covers; the orchestrator
+  only launches shards and merges their raw samples. If any shard fails or
+  the run is interrupted, every sibling shard is terminated so nothing
+  keeps spending unsupervised.
+- **Retries off when measuring failures, on when simulating production.**
+  The ramp, bracket, and probe disable retries so raw failure rates stay
+  visible; the operating-point and sustained runs use the retry
+  policy.
+- **Committed evidence is machine-generated, redacted, and hashed.** It
+  contains numeric aggregates, retry breakdowns, configuration, and a
+  SHA-256 for every raw source (including shard reports). It is commited 
+  to the repository for historical record.
+- **Campaigns cannot mix.** Stage artifacts are never overwritten, and the
+  evidence generator rejects shard files that don't match their merged
+  report — so reusing a RUN_ID fails fast instead of blending old and new
+  data. (An earlier revision also validated overall campaign shape; it
+  cost more review surface than the risk it prevented and was cut.)
 
 ## Limitations
 
-- No multi-hour soak: quota-over-time, credential refresh, connection reuse,
-  memory growth, and latency drift beyond 5 minutes are unmeasured.
-- Sustained evidence above 24 RPS is 60 seconds long; 30-second stages reveal
-  gross saturation, not slow drift.
-- All shards ran on one 10-core host and one egress path. The 600-RPS
-  sustained degradation is confounded between provider pushback and client
-  resources; the 400-RPS stage's 9.4 ms worst-shard scheduler lag suggests
-  the host was near its comfortable limit at 8 shards.
-- Shared PayGo capacity makes every clean high-rate stage weather-dependent;
-  none of these numbers are capacity guarantees, and the usage-tier baseline
-  depends on organization spend, which a take-home project does not
-  represent.
-- Short prompts, small outputs, one model, one region. Larger contexts,
-  multimodal inputs, tool use, and streaming were untested; time-to-first-
-  token was not measured, which a streaming consumer would need.
-- The quality set is small and deterministic — a regression tripwire, not a
-  general quality assessment.
+- **All evidence is short.** The longest runs are five minutes at 24 RPS
+  and 60 seconds at 300 RPS. Multi-hour behavior — quota over time,
+  credential refresh, connection reuse, memory growth, slow latency drift —
+  is unmeasured, and 30-second stages can only reveal abrupt saturation,
+  not gradual degradation.
+- **One machine generated all the load.** Every shard ran on a single
+  10-core host over one network path. At sustained 600 RPS I cannot cleanly
+  separate provider slowdown from client resource limits, and the 400-RPS
+  stage's 9.4 ms worst-shard scheduler lag hints the host was near its
+  comfortable limit with eight shards.
+- **Available capacity varies with other customers' traffic.** Pay-as-you-go
+  Vertex draws on a capacity pool shared across Google's customers, so the
+  throughput available at any moment depends on demand outside our control.
+  The clean high-rate stages here describe the pool's state during the test
+  window, not a guarantee it will repeat. Throughput baselines also scale
+  with organization spend, and a take-home project's spend resembles no
+  production organization.
+- **The workload is narrow.** Short prompts, small outputs, one model, one
+  region. Long contexts, multimodal inputs, tool use, and streaming were
+  untested, and time-to-first-token — the number a streaming consumer cares
+  about — was never measured.
+- **The quality checks are a tripwire, not an assessment.** Ten
+  deterministic cases catch regressions and configuration interactions;
+  they say nothing about general model quality.
 
 ## Production next steps
 
 1. Multi-hour soak at 24 RPS (and a shorter one at ~100 RPS), watching p95
    drift, 429/499/5xx rates, retry amplification, credentials, connections,
    and memory.
-2. Price **Provisioned Throughput** against measured token throughput before
-   any capacity commitment; spend-tiered shared capacity is fine for a pilot,
-   not for an SLO.
-3. Decide 499 handling explicitly, and alarm on latency inflation — at the
-   observed edge, p95 drifts while error rate stays zero, so error-rate-only
-   alerting would miss it.
+2. Price [**Provisioned Throughput**](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/provisioned-throughput) before making any capacity commitment,
+   using the token rates measured here as the sizing input. Shared capacity
+   is fine for a pilot, but an SLO cannot be built on throughput that other
+   customers' traffic can take away.
+3. Setup monitoring, logging, and alerting for spikes in error rate and latency
 4. Enforce the rule that a tight `max_output_tokens` requires an explicit
    thinking budget.
 5. Replace developer ADC with production identity and explicit quota/billing
    ownership; correlate client request IDs with server-side telemetry.
-6. Distribute the load generator before claiming anything above 600 RPS;
+6. Scale the load generator horizontally before claiming anything above 600 RPS;
    expand quality coverage before reusing these conclusions on other workload
    shapes.
 
