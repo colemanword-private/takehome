@@ -73,7 +73,7 @@ endef
 .PHONY: \
 	help bootstrap check-python check-provider prepare-results test \
 	synthetic-smoke provider-smoke quality quality-baseline quality-controlled \
-	capacity-ramp retry-off retry-on soak
+	quality-factorial capacity-ramp retry-off retry-on soak evidence
 
 # Print available workflows and common overrides. This sends no provider requests.
 help:
@@ -87,6 +87,8 @@ help:
 		'Provider experiments (billable):' \
 		'  make provider-smoke         Make one low-cost provider request.' \
 		'  make quality                Run baseline and controlled quality evals.' \
+		'  make quality-factorial      Run thinking x output-cap cells with repeats.' \
+		'  make evidence RUN_ID=...    Build the sanitized evidence manifest (free).' \
 		'  make capacity-ramp          Run staged load with retries off.' \
 		'  make retry-off RETRY_RPS=N  Measure the selected rate without retries.' \
 		'  make retry-on RETRY_RPS=N   Repeat it with production retries.' \
@@ -189,6 +191,39 @@ quality-baseline: check-provider prepare-results
 		--max-retries 0 \
 		--concurrency 2 \
 		--output "$(EVAL_RESULTS_DIR)/02-$(PROVIDER)-quality-baseline.json"
+
+# Factorial quality experiment: thinking {default, 0} x output-cap {none, 256},
+# FACTORIAL_REPEATS runs per cell. "default" and "none" omit the control so the
+# provider's own default applies.
+FACTORIAL_REPEATS ?= 3
+FACTORIAL_THINKING ?= default 0
+FACTORIAL_MAX_OUTPUT ?= none 256
+
+# BILLABLE: run every factorial cell as an independent quality evaluation with
+# its own artifact. A failing cell does not skip the remaining cells; the
+# combined exit status stays nonzero so the failure is still visible.
+quality-factorial: check-provider prepare-results
+	@set -eu; \
+	$(LOAD_PROVIDER_ENV) \
+	status=0; \
+	for thinking in $(FACTORIAL_THINKING); do \
+		for cap in $(FACTORIAL_MAX_OUTPUT); do \
+			for repeat in $$(seq 1 $(FACTORIAL_REPEATS)); do \
+				cell_args=""; \
+				if [ "$$thinking" != "default" ]; then cell_args="$$cell_args --thinking-budget $$thinking"; fi; \
+				if [ "$$cap" != "none" ]; then cell_args="$$cell_args --max-output-tokens $$cap"; fi; \
+				output="$(EVAL_RESULTS_DIR)/02-$(PROVIDER)-quality-think-$$thinking-cap-$$cap-r$$repeat.json"; \
+				echo "Quality cell thinking=$$thinking cap=$$cap repeat=$$repeat..."; \
+				"$(PYTHON)" "$(PROJECT_DIR)/quality_eval.py" \
+					$(PROVIDER_ARGS) \
+					$$cell_args \
+					--max-retries 0 \
+					--concurrency 2 \
+					--output "$$output" || status=1; \
+			done; \
+		done; \
+	done; \
+	exit $$status
 
 # BILLABLE: repeat the golden cases with explicit supported controls and no retries,
 # so quality, token, and latency changes remain directly observable.
@@ -305,3 +340,12 @@ soak: check-provider prepare-results
 		--warmup-requests 5 \
 		--temperature "$(TEMPERATURE)" \
 		--output "$(LOAD_RESULTS_DIR)/07-$(PROVIDER)-soak-$(SOAK_RPS)rps.json"
+
+# Aggregate one run's raw artifacts into the sanitized, checksummed evidence
+# manifest that is safe to commit. Sends no provider requests.
+evidence: check-python
+	@"$(PYTHON)" "$(PROJECT_DIR)/evidence_manifest.py" \
+		--run-id "$(RUN_ID)" \
+		--provider-dir "$(PROVIDER_PATH)" \
+		--model-dir "$(MODEL_PATH)" \
+		--project-dir "$(PROJECT_DIR)"

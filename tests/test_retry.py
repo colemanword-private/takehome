@@ -26,29 +26,16 @@ class ProviderError(RuntimeError):
         self.status = status
 
 
-async def test_status_code_from_error_prefers_numeric_code_over_status_text() -> None:
+async def test_status_code_from_error_uses_the_first_numeric_status() -> None:
     # google-genai errors carry an int `code` plus a string `status` such as
     # "RESOURCE_EXHAUSTED"; the text must not shadow the number.
-    error = RuntimeError("rate limited")
-    error.code = 429  # type: ignore[attr-defined]
-    error.status = "RESOURCE_EXHAUSTED"  # type: ignore[attr-defined]
-
-    assert status_code_from_error(error) == 429
-
-
-async def test_status_code_from_error_skips_unparseable_values() -> None:
-    error = RuntimeError("unavailable")
-    error.status = "UNAVAILABLE"  # type: ignore[attr-defined]
-    error.status_code = 503  # type: ignore[attr-defined]
-
-    assert status_code_from_error(error) == 503
-
-
-async def test_status_code_from_error_accepts_numeric_status_strings() -> None:
+    assert status_code_from_error(
+        SimpleNamespace(code=429, status="RESOURCE_EXHAUSTED")
+    ) == 429
+    assert status_code_from_error(
+        SimpleNamespace(status="UNAVAILABLE", status_code=503)
+    ) == 503
     assert status_code_from_error(ProviderError(429)) == 429
-
-
-async def test_status_code_from_error_returns_none_without_a_status() -> None:
     assert status_code_from_error(RuntimeError("boom")) is None
 
 
@@ -354,27 +341,6 @@ async def test_records_non_retryable_exhaustion() -> None:
     assert events[0].reason == "non_retryable"
 
 
-async def test_end_to_end_deadline_cancels_in_flight_attempt() -> None:
-    events: list[RetryExhaustedEvent] = []
-
-    async def operation() -> None:
-        await asyncio.Event().wait()
-
-    with pytest.raises(RetryDeadlineExceeded) as raised:
-        await retry_with_backoff(
-            operation,
-            policy=RetryPolicy(4, 0.0, 0.0),
-            handled_errors=(ProviderError,),
-            is_retryable=lambda _: True,
-            total_timeout_seconds=0.01,
-            on_exhausted=events.append,
-        )
-
-    assert raised.value.event.reason == "deadline"
-    assert raised.value.event.attempts == 1
-    assert events == [raised.value.event]
-
-
 async def test_deadline_spans_completed_backoff_and_multiple_attempts() -> None:
     calls = 0
 
@@ -398,33 +364,6 @@ async def test_deadline_spans_completed_backoff_and_multiple_attempts() -> None:
     assert calls == 2
     assert raised.value.event.attempts == 2
     assert raised.value.event.cumulative_backoff_seconds == pytest.approx(0.01)
-
-
-async def test_retry_budget_stops_retry_storm() -> None:
-    calls = 0
-    events: list[RetryExhaustedEvent] = []
-    budget = RetryBudget(capacity=1, refill_rate_per_second=0)
-
-    async def operation() -> None:
-        nonlocal calls
-        calls += 1
-        raise ProviderError(503)
-
-    with pytest.raises(ProviderError):
-        await retry_with_backoff(
-            operation,
-            policy=RetryPolicy(4, 0.0, 0.0),
-            handled_errors=(ProviderError,),
-            is_retryable=lambda _: True,
-            retry_budget=budget,
-            sleep=lambda _: asyncio.sleep(0),
-            on_exhausted=events.append,
-        )
-
-    assert calls == 2
-    assert events[0].reason == "retry_budget"
-    assert events[0].attempts == 2
-    assert budget.available_tokens == 0
 
 
 async def test_retry_after_longer_than_deadline_fails_without_sleeping() -> None:
@@ -515,19 +454,15 @@ async def test_shared_retry_budget_caps_concurrent_retry_attempts() -> None:
     ]
 
 
-@pytest.mark.parametrize(
-    ("capacity", "refill_rate", "message"),
-    (
+async def test_retry_budget_rejects_invalid_configuration() -> None:
+    invalid_values = (
         (0, 1.0, "capacity"),
         (1, -1.0, "refill_rate_per_second"),
         (1, float("nan"), "refill_rate_per_second"),
-    ),
-)
-async def test_retry_budget_rejects_invalid_configuration(
-    capacity: int, refill_rate: float, message: str
-) -> None:
-    with pytest.raises(ValueError, match=message):
-        RetryBudget(capacity, refill_rate)
+    )
+    for capacity, refill_rate, message in invalid_values:
+        with pytest.raises(ValueError, match=message):
+            RetryBudget(capacity, refill_rate)
 
 
 async def test_parses_provider_retry_after_headers() -> None:

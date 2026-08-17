@@ -109,6 +109,7 @@ class RequestSample:
     queue_delay_seconds: float
     input_tokens: int = 0
     output_tokens: int = 0
+    thought_tokens: int = 0
     error_type: str | None = None
     status_code: int | None = None
 
@@ -304,6 +305,7 @@ async def _run_phase(
                         queue_delay_seconds=request_started - scheduled_at,
                         input_tokens=response.input_tokens,
                         output_tokens=response.output_tokens,
+                        thought_tokens=response.thought_tokens,
                     )
                 )
             except Exception as error:
@@ -419,6 +421,9 @@ def _summarize(
         ),
         "observed_input_tokens": sum(sample.input_tokens for sample in samples),
         "observed_output_tokens": sum(sample.output_tokens for sample in samples),
+        # The share of output that was hidden thinking, when the provider
+        # reports it; included in observed_output_tokens.
+        "observed_thought_tokens": sum(sample.thought_tokens for sample in samples),
         # A provider may bill a request that times out locally; only provider-side
         # billing telemetry can close that observability gap.
         "token_usage_scope": (

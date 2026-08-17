@@ -145,3 +145,30 @@ async def test_case_tokens_come_only_from_declared_response_errors() -> None:
     # undeclared exception type are not trusted as billing telemetry.
     assert report["observed_input_tokens"] == 8 * 5 + 7
     assert report["observed_output_tokens"] == 8 * 2 + 3
+
+
+async def test_report_separates_thought_tokens() -> None:
+    dataset = GoldenDataset.load(GOLDEN_DATASET)
+    outputs: dict[str, str | BaseException] = {
+        case.input: _passing_output(case.id) for case in dataset.cases
+    }
+
+    class ThinkingQualityProvider(FakeQualityProvider):
+        async def ask_generic_question(
+            self, system_prompt: str, question: str, temperature: float
+        ) -> LLM.SimpleResponse:
+            response = await super().ask_generic_question(
+                system_prompt, question, temperature
+            )
+            return LLM.SimpleResponse(
+                response.answer,
+                response.input_tokens,
+                response.output_tokens,
+                thought_tokens=1,
+            )
+
+    report = await evaluate_dataset(
+        ThinkingQualityProvider(outputs), dataset, concurrency=2
+    )
+
+    assert report["observed_thought_tokens"] == 10

@@ -30,6 +30,7 @@ class CaseResult:
     latency_seconds: float
     input_tokens: int
     output_tokens: int
+    thought_tokens: int
     output: str | None
     validations: tuple[dict[str, object], ...]
     error_type: str | None = None
@@ -75,6 +76,9 @@ async def evaluate_dataset(
         "pass_rate": passed_count / len(results),
         "observed_input_tokens": sum(result.input_tokens for result in results),
         "observed_output_tokens": sum(result.output_tokens for result in results),
+        # The share of output that was hidden thinking, when the provider
+        # reports it; included in observed_output_tokens.
+        "observed_thought_tokens": sum(result.thought_tokens for result in results),
         "by_category": {
             category: dict(counts)
             for category, counts in sorted(category_counts.items())
@@ -106,6 +110,7 @@ async def _evaluate_case(provider: LLM, case: GoldenCase) -> CaseResult:
             latency_seconds=time.perf_counter() - started,
             input_tokens=billed_input,
             output_tokens=billed_output,
+            thought_tokens=0,
             output=None,
             validations=(),
             error_type=type(error).__name__,
@@ -120,6 +125,7 @@ async def _evaluate_case(provider: LLM, case: GoldenCase) -> CaseResult:
         latency_seconds=time.perf_counter() - started,
         input_tokens=response.input_tokens,
         output_tokens=response.output_tokens,
+        thought_tokens=response.thought_tokens,
         output=response.answer,
         validations=tuple(asdict(validation) for validation in validations),
     )

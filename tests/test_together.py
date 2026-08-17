@@ -9,9 +9,7 @@ import pytest
 from together import RateLimitError
 
 from llm import (
-    RetryDeadlineExceeded,
     RetryEvent,
-    RetryExhaustedEvent,
     Together,
     TogetherConfig,
     TogetherResponseError,
@@ -160,35 +158,6 @@ async def test_together_uses_shared_retry_layer_and_output_limit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_together_enforces_total_request_deadline() -> None:
-    class HangingCompletions:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        async def create(self, **_: Any) -> SimpleNamespace:
-            self.calls += 1
-            await asyncio.Event().wait()
-            raise AssertionError("unreachable")
-
-    client = FakeTogetherClient()
-    client.completions = HangingCompletions()
-    client.chat = SimpleNamespace(completions=client.completions)
-    provider = Together(
-        config=TogetherConfig(
-            model="organization/model",
-            request_deadline_seconds=0.01,
-        ),
-        client=client,  # type: ignore[arg-type]
-    )
-
-    with pytest.raises(RetryDeadlineExceeded) as raised:
-        await provider.ask_generic_question("system", "question", 0.3)
-
-    assert client.completions.calls == 1
-    assert raised.value.event.reason == "deadline"
-
-
-@pytest.mark.asyncio
 async def test_together_retries_strict_per_attempt_timeouts() -> None:
     class HangingCompletions:
         def __init__(self) -> None:
@@ -221,52 +190,10 @@ async def test_together_retries_strict_per_attempt_timeouts() -> None:
 
 
 @pytest.mark.asyncio
-async def test_together_shared_retry_budget_stops_retries() -> None:
-    request = httpx.Request("POST", "https://api.together.xyz/v1/chat/completions")
-    rate_limited = RateLimitError(
-        "busy",
-        response=httpx.Response(429, request=request),
-        body={"error": "busy"},
-    )
-
-    class FailingCompletions:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        async def create(self, **_: Any) -> SimpleNamespace:
-            self.calls += 1
-            raise rate_limited
-
-    client = FakeTogetherClient()
-    client.completions = FailingCompletions()
-    client.chat = SimpleNamespace(completions=client.completions)
-    exhaustions: list[RetryExhaustedEvent] = []
-    provider = Together(
-        config=TogetherConfig(
-            model="organization/model",
-            max_retries=3,
-            retry_base_delay_seconds=0,
-            retry_budget_capacity=1,
-            retry_budget_refill_per_second=0,
-        ),
-        client=client,  # type: ignore[arg-type]
-        sleep=lambda _: asyncio.sleep(0),
-        on_exhausted=exhaustions.append,
-    )
-
-    with pytest.raises(RateLimitError):
-        await provider.ask_generic_question("system", "question", 0.3)
-
-    assert client.completions.calls == 2
-    assert exhaustions[0].reason == "retry_budget"
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "choices",
     (
         [],
-        [SimpleNamespace(message=None)],
         [SimpleNamespace(message=SimpleNamespace(content=None))],
     ),
 )

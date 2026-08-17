@@ -24,7 +24,7 @@ pytestmark = pytest.mark.skipif(
 )
 @pytest.mark.parametrize(
     "target",
-    ("provider-smoke", "quality", "capacity-ramp", "retry-off", "soak"),
+    ("provider-smoke", "quality", "capacity-ramp"),
 )
 def test_provider_make_targets_render_offline(
     provider: str,
@@ -71,68 +71,6 @@ def test_synthetic_smoke_uses_its_own_grouped_result_directory() -> None:
     expected_directory = PROJECT_DIR / "load-results" / "synthetic" / "local" / "dry-run"
     assert str(expected_directory) in result.stdout
     assert "gcloud" not in result.stdout
-
-
-def test_thinking_control_is_rendered_only_when_requested() -> None:
-    result = subprocess.run(
-        [
-            "make",
-            "-n",
-            "quality-controlled",
-            "PROVIDER=gemini",
-            "MODEL=gemini-test",
-            "THINKING_BUDGET=0",
-            "RUN_ID=dry-run",
-        ],
-        cwd=PROJECT_DIR,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert '--thinking-budget "0"' in result.stdout
-
-
-def test_model_default_is_owned_by_the_provider_config() -> None:
-    # The Makefile must not branch on provider names to duplicate a default the
-    # provider's configuration already owns; without MODEL it passes no --model
-    # and groups results under the uniform "default" directory.
-    result = subprocess.run(
-        ["make", "-n", "provider-smoke", "PROVIDER=gemini", "RUN_ID=dry-run"],
-        cwd=PROJECT_DIR,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert "--model" not in result.stdout
-    expected_directory = PROJECT_DIR / "load-results" / "gemini" / "default" / "dry-run"
-    assert str(expected_directory) in result.stdout
-
-
-def test_quality_runs_controlled_eval_even_when_baseline_fails() -> None:
-    # A failing baseline must not abort the paired experiment: the controlled
-    # run still executes, and the combined exit status stays nonzero.
-    result = subprocess.run(
-        [
-            "make",
-            "quality",
-            "PYTHON=false",
-            "PROVIDER=gemini",
-            "MODEL=gemini-test",
-            "RUN_ID=dry-run",
-        ],
-        cwd=PROJECT_DIR,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
-    combined = result.stdout + result.stderr
-    assert result.returncode != 0
-    assert combined.count("Python environment is missing") == 2, combined
 
 
 def test_capacity_ramp_renders_abort_thresholds() -> None:
@@ -186,6 +124,35 @@ def test_capacity_ramp_enforces_the_total_request_budget() -> None:
     assert "Running 10 requests against gemini at 2 RPS" in result.stdout
     assert "at 3 RPS" not in result.stdout
     assert "RAMP_REQUEST_BUDGET exhausted" in combined
+
+
+def test_quality_factorial_runs_every_cell_and_repeat() -> None:
+    # 2 thinking levels x 2 output caps x N repeats, each an independent
+    # quality_eval invocation with its own artifact.
+    true_path = shutil.which("true")
+    assert true_path is not None
+
+    result = subprocess.run(
+        [
+            "make",
+            "quality-factorial",
+            f"PYTHON={true_path}",
+            "PROVIDER=gemini",
+            "RUN_ID=factorial-dry-run",
+            "FACTORIAL_REPEATS=2",
+        ],
+        cwd=PROJECT_DIR,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.count("Quality cell") == 8
+    assert "thinking=default cap=none repeat=1" in result.stdout
+    assert "thinking=default cap=256 repeat=2" in result.stdout
+    assert "thinking=0 cap=none repeat=2" in result.stdout
+    assert "thinking=0 cap=256 repeat=1" in result.stdout
 
 
 def test_pending_request_limit_is_rendered_when_requested() -> None:

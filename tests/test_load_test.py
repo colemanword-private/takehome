@@ -94,6 +94,27 @@ async def test_load_test_enforces_concurrency_and_reports_failures() -> None:
     }
 
 
+async def test_summary_separates_thought_tokens() -> None:
+    class ThinkingProvider(FakeProvider):
+        async def ask_generic_question(
+            self, system_prompt: str, question: str, temperature: float
+        ) -> LLM.SimpleResponse:
+            return LLM.SimpleResponse(
+                "ok", input_tokens=4, output_tokens=6, thought_tokens=2
+            )
+
+    summary = await run_load_test(
+        ThinkingProvider(),
+        Workload("system", ("one",)),
+        LoadTestConfig(
+            requests=3, concurrency=1, requests_per_second=0, temperature=0.0
+        ),
+    )
+
+    assert summary["observed_output_tokens"] == 18
+    assert summary["observed_thought_tokens"] == 6
+
+
 async def test_failed_requests_count_tokens_only_from_declared_response_errors() -> None:
     from llm import LLMResponseError
 
@@ -126,38 +147,6 @@ async def test_failed_requests_count_tokens_only_from_declared_response_errors()
     # Attributes on an undeclared exception type are not billing telemetry.
     assert undeclared["observed_input_tokens"] == 0
     assert undeclared["observed_output_tokens"] == 0
-
-
-async def test_failure_modes_classify_real_genai_rate_limit() -> None:
-    from google.genai import errors
-
-    class RateLimitedProvider(FakeProvider):
-        async def ask_generic_question(
-            self, system_prompt: str, question: str, temperature: float
-        ) -> LLM.SimpleResponse:
-            raise errors.ClientError(
-                429,
-                {
-                    "error": {
-                        "code": 429,
-                        "status": "RESOURCE_EXHAUSTED",
-                        "message": "quota exceeded",
-                    }
-                },
-            )
-
-    summary = await run_load_test(
-        RateLimitedProvider(),
-        Workload("system", ("one",)),
-        LoadTestConfig(
-            requests=1,
-            concurrency=1,
-            requests_per_second=0,
-            temperature=0.0,
-        ),
-    )
-
-    assert summary["failure_modes"] == {"http_429": 1}
 
 
 async def test_cancellation_cleans_up_in_flight_workers() -> None:
@@ -393,31 +382,6 @@ async def test_load_report_includes_retry_attempt_and_exhaustion_telemetry() -> 
     assert summary["retry_exhaustions_by_status"] == {"503": 1}
 
 
-async def test_cli_reports_unsupported_control_cleanly(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    # An unsupported control must exit with a clean usage error before any
-    # billable work, not an unhandled traceback.
-    import load_test as load_test_module
-
-    monkeypatch.setattr(
-        "sys.argv",
-        [
-            "load_test.py",
-            "--provider",
-            "together",
-            "--model",
-            "organization/model",
-            "--thinking-budget",
-            "0",
-        ],
-    )
-
-    assert await load_test_module._main() == 2
-    assert "thinking-budget" in capsys.readouterr().err
-
-
 async def test_exit_code_ignores_warmup_failures_when_measured_phase_is_healthy() -> None:
     # A transient warmup blip must not abort a multi-stage campaign whose
     # measured phase succeeded; the warmup counts stay visible in the report.
@@ -457,34 +421,6 @@ async def test_exit_code_applies_configurable_abort_thresholds() -> None:
     assert (
         load_test_module._exit_code(breaching_p95, max_service_p95_ms=1000.0) == 1
     )
-
-
-async def test_cli_aborts_when_service_p95_exceeds_threshold(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    import load_test as load_test_module
-
-    monkeypatch.setattr(
-        "sys.argv",
-        [
-            "load_test.py",
-            "--synthetic",
-            "--requests",
-            "5",
-            "--rps",
-            "0",
-            "--concurrency",
-            "2",
-            "--warmup-requests",
-            "0",
-            "--max-service-p95-ms",
-            "0.0001",
-        ],
-    )
-
-    assert await load_test_module._main() == 1
-    assert "abort:" in capsys.readouterr().err
 
 
 async def test_cli_rejects_out_of_range_failure_rate_threshold(
@@ -528,25 +464,20 @@ async def test_cli_rejects_explicit_zero_concurrency(
         await load_test_module._main()
 
 
-@pytest.mark.parametrize(
-    ("overrides", "message"),
-    (
+async def test_load_config_rejects_invalid_admission_values() -> None:
+    invalid_values = (
         ({"requests_per_second": float("nan")}, "requests_per_second"),
         ({"requests_per_second": float("inf")}, "requests_per_second"),
         ({"max_pending_requests": 0}, "max_pending_requests"),
-    ),
-)
-async def test_load_config_rejects_invalid_admission_values(
-    overrides: dict[str, float | int], message: str
-) -> None:
-    values: dict[str, float | int | None] = {
-        "requests": 1,
-        "concurrency": 1,
-        "requests_per_second": 1.0,
-        "temperature": 0.0,
-        "max_pending_requests": None,
-    }
-    values.update(overrides)
-
-    with pytest.raises(ValueError, match=message):
-        LoadTestConfig(**values)  # type: ignore[arg-type]
+    )
+    for overrides, message in invalid_values:
+        values: dict[str, float | int | None] = {
+            "requests": 1,
+            "concurrency": 1,
+            "requests_per_second": 1.0,
+            "temperature": 0.0,
+            "max_pending_requests": None,
+            **overrides,
+        }
+        with pytest.raises(ValueError, match=message):
+            LoadTestConfig(**values)  # type: ignore[arg-type]

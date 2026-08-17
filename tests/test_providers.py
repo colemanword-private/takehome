@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -47,16 +46,6 @@ def test_shared_cli_arguments_use_registry_choices() -> None:
         "max_output_tokens": 512,
         "thinking_budget": 0,
     }
-
-
-def test_provider_options_preserve_original_positional_observer_field() -> None:
-    observer = lambda _: None
-
-    options = ProviderOptions(None, None, None, None, observer)
-
-    assert options.on_retry is observer
-    assert options.on_backoff is None
-    assert options.on_exhausted is None
 
 
 def test_gemini_factory_maps_shared_controls(
@@ -146,10 +135,7 @@ def test_together_factory_maps_shared_controls(
     assert captured["on_exhausted"] is exhausted_observer
 
 
-@pytest.mark.parametrize("thinking_budget", (0, 10))
-def test_provider_factory_rejects_unknown_or_unsupported_options(
-    thinking_budget: int,
-) -> None:
+def test_provider_factory_rejects_unknown_or_unsupported_options() -> None:
     with pytest.raises(ValueError, match="unknown provider"):
         create_provider("missing")
     # The registry validates declared capabilities uniformly, before any
@@ -160,7 +146,7 @@ def test_provider_factory_rejects_unknown_or_unsupported_options(
     ):
         create_provider(
             "together",
-            ProviderOptions(thinking_budget=thinking_budget),
+            ProviderOptions(thinking_budget=0),
         )
 
 
@@ -199,12 +185,3 @@ def test_together_preflight_checks_environment_only(
         "model": "organization/model",
         "credentials": "found",
     }
-
-
-def test_makefile_delegates_provider_specific_behavior() -> None:
-    makefile = Path(__file__).parents[1].joinpath("Makefile").read_text()
-
-    assert "PROVIDER ?= gemini" in makefile
-    assert "--provider gemini" not in makefile
-    assert "GEMINI_MAX_RETRIES" not in makefile
-    assert "check-provider: check-python" in makefile

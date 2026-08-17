@@ -256,7 +256,7 @@ class Gemini(LLM):
         )
         # Capture usage before inspecting text: safety-blocked and otherwise empty
         # responses may still consume billable tokens that callers need to observe.
-        input_tokens, output_tokens = _token_counts(response)
+        input_tokens, output_tokens, thought_tokens = _token_counts(response)
         answer = response.text
         if not answer:
             raise GeminiResponseError(
@@ -269,6 +269,7 @@ class Gemini(LLM):
             answer=answer,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            thought_tokens=thought_tokens,
         )
 
     async def close(self) -> None:
@@ -357,10 +358,10 @@ def check_gemini_readiness(model: str | None = None) -> dict[str, object]:
     }
 
 
-def _token_counts(response: Any) -> tuple[int, int]:
+def _token_counts(response: Any) -> tuple[int, int, int]:
     usage = getattr(response, "usage_metadata", None)
     if usage is None:
-        return 0, 0
+        return 0, 0, 0
 
     input_tokens = int(getattr(usage, "prompt_token_count", 0) or 0)
     candidate_tokens = int(getattr(usage, "candidates_token_count", 0) or 0)
@@ -368,12 +369,13 @@ def _token_counts(response: Any) -> tuple[int, int]:
     total_tokens = getattr(usage, "total_token_count", None)
 
     # Gemini thinking tokens are hidden from response.text but still consume output
-    # capacity. Prefer total minus prompt so they are not silently discarded.
+    # capacity. Prefer total minus prompt so they are not silently discarded; the
+    # thought count is also returned separately so artifacts can attribute it.
     if total_tokens is None:
         output_tokens = candidate_tokens + thought_tokens
     else:
         output_tokens = max(candidate_tokens, int(total_tokens) - input_tokens)
-    return input_tokens, output_tokens
+    return input_tokens, output_tokens, thought_tokens
 
 
 def _is_retryable(error: BaseException) -> bool:

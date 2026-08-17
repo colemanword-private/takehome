@@ -23,6 +23,9 @@ class LLM:
         answer: str
         input_tokens: int
         output_tokens: int
+        # Hidden reasoning tokens included in output_tokens; providers without
+        # a thinking mode leave this at zero.
+        thought_tokens: int = 0
 
     async def ask_generic_question(
         self, system_prompt: str, question: str, temperature: float
