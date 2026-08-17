@@ -1,4 +1,4 @@
-"""Environment-variable parsing shared by every provider configuration."""
+"""Environment-variable parsing for the Gemini runtime configuration."""
 
 from __future__ import annotations
 

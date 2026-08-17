@@ -6,11 +6,10 @@ import inspect
 import math
 import os
 import random
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 import httpx
-import google.auth
 from google import genai
 from google.auth import exceptions as google_auth_exceptions
 from google.genai import errors, types
@@ -61,6 +60,8 @@ class GeminiConfig:
 
     @classmethod
     def from_env(cls) -> GeminiConfig:
+        """Build a config from GOOGLE_CLOUD_* / GEMINI_* environment
+        variables; only the project is required."""
         project = os.getenv("GOOGLE_CLOUD_PROJECT")
         if not project:
             raise ValueError("GOOGLE_CLOUD_PROJECT must be set for Vertex AI")
@@ -98,36 +99,21 @@ class GeminiConfig:
         )
 
     def __post_init__(self) -> None:
-        if not self.project:
-            raise ValueError("project must not be empty")
-        if not self.location:
-            raise ValueError("location must not be empty")
-        if not self.model:
-            raise ValueError("model must not be empty")
+        if not all((self.project, self.location, self.model)):
+            raise ValueError("project, location, and model must not be empty")
         if self.parallelism < 1:
             raise ValueError("parallelism must be at least 1")
-        if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be finite and positive")
-        if (
-            not math.isfinite(self.request_deadline_seconds)
-            or self.request_deadline_seconds <= 0
+        for name, value in (
+            ("timeout_seconds", self.timeout_seconds),
+            ("request_deadline_seconds", self.request_deadline_seconds),
         ):
-            raise ValueError("request_deadline_seconds must be finite and positive")
-        if self.max_retries < 0:
-            raise ValueError("max_retries must not be negative")
-        if (
-            not math.isfinite(self.retry_base_delay_seconds)
-            or self.retry_base_delay_seconds < 0
-        ):
-            raise ValueError(
-                "retry_base_delay_seconds must be finite and non-negative"
-            )
-        if not math.isfinite(self.retry_max_delay_seconds):
-            raise ValueError("retry_max_delay_seconds must be finite")
-        if self.retry_max_delay_seconds < self.retry_base_delay_seconds:
-            raise ValueError(
-                "retry_max_delay_seconds must be at least retry_base_delay_seconds"
-            )
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        RetryPolicy(
+            self.max_retries,
+            self.retry_base_delay_seconds,
+            self.retry_max_delay_seconds,
+        )
         if self.retry_budget_capacity < 1:
             raise ValueError("retry_budget_capacity must be at least 1")
         if (
@@ -236,6 +222,15 @@ class Gemini(LLM):
     async def ask_generic_question(
         self, system_prompt: str, question: str, temperature: float
     ) -> LLM.SimpleResponse:
+        """Ask one question, retrying transient faults within the request
+        deadline.
+
+        Raises GeminiResponseError (with billable usage attached) when
+        Vertex returns HTTP success but no text, RetryDeadlineExceeded when
+        the end-to-end deadline expires, and the underlying provider or
+        transport error when retries are exhausted or the error is not
+        retryable.
+        """
         if self._closed:
             raise RuntimeError("Gemini client is closed")
         if not 0.0 <= temperature <= 2.0:
@@ -307,7 +302,8 @@ class Gemini(LLM):
         generation_config: types.GenerateContentConfig,
     ) -> Any:
         async def generate_once() -> Any:
-            # The outer deadline also bounds authentication and SDK transport work.
+            # wait_for bounds the whole attempt — including authentication
+            # and SDK transport work the HTTP-level timeout cannot see.
             return await asyncio.wait_for(
                 self._async_client.models.generate_content(
                     model=self._config.model,
@@ -332,32 +328,6 @@ class Gemini(LLM):
             on_retry=self._on_retry,
             on_exhausted=self._on_exhausted,
         )
-
-
-def check_gemini_readiness(model: str | None = None) -> dict[str, object]:
-    """Validate local Vertex configuration and ADC without calling Vertex AI."""
-    config = GeminiConfig.from_env()
-    if model is not None:
-        config = replace(config, model=model)
-    try:
-        google.auth.default(
-            scopes=["https://www.googleapis.com/auth/cloud-platform"]
-        )
-    except google_auth_exceptions.DefaultCredentialsError as error:
-        raise ValueError(
-            "Application Default Credentials are missing; run "
-            "`gcloud auth application-default login`"
-        ) from error
-    return {
-        "provider": "gemini",
-        "platform": "Vertex AI",
-        "project": config.project,
-        "location": config.location,
-        "model": config.model,
-        "credentials": "found",
-    }
-
-
 def _token_counts(response: Any) -> tuple[int, int, int]:
     usage = getattr(response, "usage_metadata", None)
     if usage is None:
@@ -402,5 +372,3 @@ def _empty_response_message(response: Any) -> str:
         details.append(f"finish_reason={finish_reason}")
     suffix = f" ({', '.join(details)})" if details else ""
     return f"Gemini returned no text{suffix}"
-
-

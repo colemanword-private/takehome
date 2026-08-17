@@ -22,3 +22,17 @@ We're less interested in a "completed checklist" and more interested in what you
 - Anything you discovered about this model — quirks, failure modes, parameters that mattered, things that surprised you compared to other LLMs you've used.
 - Decisions you made and the tradeoffs behind them. If you tried something that didn't work, that's worth including too.
 - What you'd want to do next if this were going to production, and what you'd want to know before getting there.
+
+# Submission
+
+The write-up is **[FINDINGS.md](FINDINGS.md)**; the numbers it cites are
+hash-backed in `evidence/gemini/gemini-2.5-flash/*-summary.{json,md}`.
+
+- Provider: `llm/gemini.py` (retry/backoff engine in `llm/retry.py`).
+- Harnesses: `load_test.py` (single-process open-loop), `multi_load.py`
+  (multi-process shards for rates above one event loop), `quality_eval.py`
+  (golden-dataset factorial).
+- Quickstart: `make bootstrap && make test` (offline, no credentials).
+  Live targets (`provider-smoke`, `sharded-bracket`, `quota-probe`,
+  `operating-point`, …) need `gcloud` ADC and `GOOGLE_CLOUD_PROJECT` in `.env`;
+  reproduction commands are at the bottom of FINDINGS.md.

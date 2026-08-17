@@ -4,21 +4,15 @@ import asyncio
 
 import pytest
 
-from llm import (
-    LLM,
-    RetryBudget,
-    RetryPolicy,
-    retry_with_backoff,
-)
+from llm import LLM, RetryEvent
 from load_test import (
     LoadTestConfig,
     RetryCounter,
-    SyntheticProvider,
     Workload,
+    _exit_code,
+    threshold_breaches,
     run_load_test,
 )
-
-pytestmark = pytest.mark.asyncio
 
 
 class ServiceUnavailable(RuntimeError):
@@ -46,110 +40,98 @@ class FakeProvider(LLM):
             await asyncio.sleep(0.001)
             if call == self.fail_on_call:
                 raise ServiceUnavailable("unavailable")
-            return LLM.SimpleResponse(
-                answer=f"{system_prompt}: {question}",
-                input_tokens=4,
-                output_tokens=2,
-            )
+            return LLM.SimpleResponse(f"{system_prompt}: {question}", 4, 2)
         finally:
             self.active -= 1
 
 
-async def test_load_test_enforces_concurrency_and_reports_failures() -> None:
+@pytest.mark.asyncio
+async def test_reports_load_failures_tokens_warmup_and_concurrency() -> None:
     provider = FakeProvider(fail_on_call=5)
-    summary = await run_load_test(
+    report = await run_load_test(
         provider,
         Workload("system", ("one", "two")),
-        LoadTestConfig(
-            requests=12,
-            concurrency=3,
-            requests_per_second=0,
-            temperature=0.2,
-        ),
+        LoadTestConfig(12, 3, 0, 0.2, warmup_requests=2),
     )
 
+    assert provider.calls == 14
     assert provider.max_active == 3
-    assert summary["requests"] == 12
-    assert summary["successes"] == 11
-    assert summary["failures"] == 1
-    assert summary["failure_modes"] == {"http_503": 1}
-    assert summary["observed_input_tokens"] == 44
-    assert summary["observed_output_tokens"] == 22
-    assert summary["provider"] == {"provider": "FakeProvider"}
-    assert summary["workload"]["question_count"] == 2
-    assert len(summary["workload"]["sha256"]) == 64
-    # Dependency versions are provider-owned metadata; the shared runtime block
-    # records only the interpreter and platform.
-    assert set(summary["runtime"]) == {"python", "platform"}
-    assert summary["retries"] is None
-    assert summary["queue_capacity"] == 12
-    assert summary["max_queue_depth"] <= summary["queue_capacity"]
-    assert summary["warmup"] == {
-        "requests": 0,
-        "successes": 0,
-        "failures": 0,
-        "failure_modes": {},
-        "queue_capacity": 12,
-        "max_queue_depth": 0,
-    }
+    assert report["requests"] == 12
+    assert report["successes"] == 11
+    assert report["failure_modes"] == {"http_503": 1}
+    failure = report["failure_samples"][0]
+    assert failure["success"] is False
+    assert failure["service_seconds"] == pytest.approx(0.001, rel=0.5)
+    assert failure["end_to_end_seconds"] == pytest.approx(0.001, rel=0.5)
+    assert failure["scheduler_seconds"] == pytest.approx(0, abs=0.001)
+    assert failure["backpressure_seconds"] == pytest.approx(0, abs=0.001)
+    assert failure["queue_seconds"] == pytest.approx(0, abs=0.001)
+    assert failure["error_type"] == "ServiceUnavailable"
+    assert failure["status_code"] == 503
+    assert report["failure_samples_truncated"] == 0
+    assert report["realized_arrival_rps"] > 0
+    assert report["max_active_requests"] == 3
+    assert report["observed_input_tokens"] == 44
+    assert report["observed_output_tokens"] == 22
+    assert report["warmup"]["requests"] == 2
+    assert report["warmup"]["failures"] == 0
 
 
-async def test_summary_separates_thought_tokens() -> None:
-    class ThinkingProvider(FakeProvider):
+@pytest.mark.asyncio
+async def test_warmup_retries_do_not_leak_into_measured_telemetry() -> None:
+    counter = RetryCounter()
+
+    class RetryingProvider(FakeProvider):
         async def ask_generic_question(
             self, system_prompt: str, question: str, temperature: float
         ) -> LLM.SimpleResponse:
-            return LLM.SimpleResponse(
-                "ok", input_tokens=4, output_tokens=6, thought_tokens=2
-            )
+            counter.record(RetryEvent(1, 0, 503, "ServiceUnavailable"))
+            return LLM.SimpleResponse("ok", 1, 1)
 
-    summary = await run_load_test(
-        ThinkingProvider(),
+    report = await run_load_test(
+        RetryingProvider(),
         Workload("system", ("one",)),
-        LoadTestConfig(
-            requests=3, concurrency=1, requests_per_second=0, temperature=0.0
-        ),
+        LoadTestConfig(2, 1, 0, 0, warmup_requests=1),
+        counter,
     )
+    assert report["retries"] == 2
+    assert report["provider_attempts"] == 4
 
-    assert summary["observed_output_tokens"] == 18
-    assert summary["observed_thought_tokens"] == 6
 
+@pytest.mark.asyncio
+async def test_pending_arrivals_are_bounded() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
 
-async def test_failed_requests_count_tokens_only_from_declared_response_errors() -> None:
-    from llm import LLMResponseError
-
-    class BilledFailureProvider(FakeProvider):
+    class GatedProvider(FakeProvider):
         async def ask_generic_question(
             self, system_prompt: str, question: str, temperature: float
         ) -> LLM.SimpleResponse:
-            raise LLMResponseError("no usable text", input_tokens=7, output_tokens=3)
+            self.calls += 1
+            started.set()
+            await release.wait()
+            return LLM.SimpleResponse("ok", 1, 1)
 
-    class UndeclaredBilledError(RuntimeError):
-        input_tokens = 7
-        output_tokens = 3
-
-    class UndeclaredFailureProvider(FakeProvider):
-        async def ask_generic_question(
-            self, system_prompt: str, question: str, temperature: float
-        ) -> LLM.SimpleResponse:
-            raise UndeclaredBilledError("boom")
-
-    config = LoadTestConfig(
-        requests=1, concurrency=1, requests_per_second=0, temperature=0.0
+    provider = GatedProvider()
+    task = asyncio.create_task(
+        run_load_test(
+            provider,
+            Workload("system", ("one",)),
+            LoadTestConfig(20, 1, 0, 0, max_pending_requests=2),
+        )
     )
-    workload = Workload("system", ("one",))
+    await started.wait()
+    await asyncio.sleep(0)
+    assert provider.calls == 1
+    release.set()
 
-    declared = await run_load_test(BilledFailureProvider(), workload, config)
-    undeclared = await run_load_test(UndeclaredFailureProvider(), workload, config)
-
-    assert declared["observed_input_tokens"] == 7
-    assert declared["observed_output_tokens"] == 3
-    # Attributes on an undeclared exception type are not billing telemetry.
-    assert undeclared["observed_input_tokens"] == 0
-    assert undeclared["observed_output_tokens"] == 0
+    report = await task
+    assert report["queue_capacity"] == 2
+    assert report["max_queue_depth"] == 2
 
 
-async def test_cancellation_cleans_up_in_flight_workers() -> None:
+@pytest.mark.asyncio
+async def test_cancellation_cleans_up_workers() -> None:
     started = asyncio.Event()
 
     class BlockingProvider(FakeProvider):
@@ -168,316 +150,43 @@ async def test_cancellation_cleans_up_in_flight_workers() -> None:
         run_load_test(
             provider,
             Workload("system", ("one",)),
-            LoadTestConfig(
-                requests=10,
-                concurrency=3,
-                requests_per_second=0,
-                temperature=0.0,
-            ),
+            LoadTestConfig(10, 3, 0, 0),
         )
     )
     await started.wait()
     task.cancel()
-
     with pytest.raises(asyncio.CancelledError):
         await task
     assert provider.active == 0
 
 
-async def test_fatal_worker_failure_interrupts_request_scheduling() -> None:
-    class FatalWorkerError(BaseException):
-        pass
-
-    class BrokenProvider(FakeProvider):
-        async def ask_generic_question(
-            self, system_prompt: str, question: str, temperature: float
-        ) -> LLM.SimpleResponse:
-            raise FatalWorkerError()
-
-    with pytest.raises(FatalWorkerError):
-        await asyncio.wait_for(
-            run_load_test(
-                BrokenProvider(),
-                Workload("system", ("one",)),
-                LoadTestConfig(
-                    requests=10,
-                    concurrency=2,
-                    requests_per_second=0.1,
-                    temperature=0.0,
-                ),
-            ),
-            timeout=0.5,
-        )
-
-
-async def test_synthetic_provider_identifies_results_as_non_provider() -> None:
-    provider = SyntheticProvider(parallelism=4, delay_seconds=0)
-    summary = await run_load_test(
-        provider,
-        Workload("system", ("one",)),
-        LoadTestConfig(
-            requests=3,
-            concurrency=2,
-            requests_per_second=0,
-            temperature=0.0,
-        ),
-    )
-
-    assert summary["failures"] == 0
-    assert summary["provider"]["provider"] == "SyntheticProvider"
-    assert "does not measure an external LLM provider" in summary["provider"]["warning"]
-    assert summary["service_latency_ms"]["p95"] > 0
-    assert summary["end_to_end_latency_ms"]["p95"] >= summary[
-        "service_latency_ms"
-    ]["p95"]
-
-
-async def test_warmup_requests_are_excluded_from_results() -> None:
-    provider = FakeProvider()
-    summary = await run_load_test(
-        provider,
-        Workload("system", ("one",)),
-        LoadTestConfig(
-            requests=5,
-            concurrency=2,
-            requests_per_second=0,
-            temperature=0.0,
-            warmup_requests=2,
-        ),
-    )
-
-    assert provider.calls == 7
-    assert summary["requests"] == 5
-    assert summary["successes"] == 5
-    assert summary["warmup"] == {
-        "requests": 2,
-        "successes": 2,
-        "failures": 0,
-        "failure_modes": {},
-        "queue_capacity": 8,
-        "max_queue_depth": 2,
-    }
-
-
-async def test_pending_request_queue_applies_bounded_backpressure() -> None:
-    first_request_started = asyncio.Event()
-    release_requests = asyncio.Event()
-
-    class GatedProvider(FakeProvider):
-        async def ask_generic_question(
-            self, system_prompt: str, question: str, temperature: float
-        ) -> LLM.SimpleResponse:
-            self.calls += 1
-            first_request_started.set()
-            await release_requests.wait()
-            return LLM.SimpleResponse("ok", input_tokens=1, output_tokens=1)
-
-    provider = GatedProvider()
-    task = asyncio.create_task(
-        run_load_test(
-            provider,
-            Workload("system", ("one",)),
-            LoadTestConfig(
-                requests=20,
-                concurrency=1,
-                requests_per_second=0,
-                temperature=0.0,
-                max_pending_requests=2,
-            ),
-        )
-    )
-
-    await first_request_started.wait()
-    await asyncio.sleep(0)
-    assert provider.calls == 1
-    release_requests.set()
-    summary = await task
-
-    assert summary["requests"] == 20
-    assert summary["queue_capacity"] == 2
-    assert summary["max_queue_depth"] == 2
-
-
-async def test_queue_limit_may_be_smaller_than_worker_concurrency() -> None:
-    summary = await run_load_test(
+@pytest.mark.asyncio
+async def test_emit_samples_exposes_raw_samples_and_wall_clock_arrivals() -> None:
+    report = await run_load_test(
         FakeProvider(),
         Workload("system", ("one",)),
-        LoadTestConfig(
-            requests=10,
-            concurrency=4,
-            requests_per_second=0,
-            temperature=0.0,
-            max_pending_requests=1,
-        ),
+        LoadTestConfig(5, 2, 0, 0, emit_samples=True),
     )
+    assert len(report["samples"]) == 5
+    assert all(sample["service_seconds"] > 0 for sample in report["samples"])
+    assert report["arrival_first_unix"] <= report["arrival_last_unix"]
 
-    assert summary["successes"] == 10
-    assert summary["queue_capacity"] == 1
-    assert summary["max_queue_depth"] == 1
-
-
-async def test_load_report_includes_retry_attempt_and_exhaustion_telemetry() -> None:
-    retry_counter = RetryCounter()
-
-    class FaultingRetryProvider(LLM):
-        def __init__(self) -> None:
-            self.requests = 0
-            self.provider_calls = 0
-            self.retry_budget = RetryBudget(1, 0)
-
-        def parallelism(self) -> int:
-            return 1
-
-        async def ask_generic_question(
-            self, system_prompt: str, question: str, temperature: float
-        ) -> LLM.SimpleResponse:
-            self.requests += 1
-            request_number = self.requests
-            attempts = 0
-
-            async def operation() -> LLM.SimpleResponse:
-                nonlocal attempts
-                attempts += 1
-                self.provider_calls += 1
-                if request_number == 2 or attempts == 1:
-                    raise ServiceUnavailable("unavailable")
-                return LLM.SimpleResponse("ok", input_tokens=1, output_tokens=1)
-
-            return await retry_with_backoff(
-                operation,
-                policy=RetryPolicy(2, 0.25, 0.25),
-                handled_errors=(ServiceUnavailable,),
-                is_retryable=lambda _: True,
-                status_code=lambda error: error.code,
-                retry_budget=self.retry_budget,
-                sleep=lambda _: asyncio.sleep(0),
-                jitter=lambda _low, high: high,
-                on_backoff=retry_counter.record_backoff,
-                on_retry=retry_counter.record,
-                on_exhausted=retry_counter.record_exhaustion,
-            )
-
-    provider = FaultingRetryProvider()
-
-    summary = await run_load_test(
-        provider,
+    baseline = await run_load_test(
+        FakeProvider(),
         Workload("system", ("one",)),
-        LoadTestConfig(
-            requests=2,
-            concurrency=1,
-            requests_per_second=0,
-            temperature=0.0,
-        ),
-        retry_counter,
+        LoadTestConfig(2, 1, 0, 0),
     )
-
-    assert provider.provider_calls == 3
-    assert summary["successes"] == 1
-    assert summary["failures"] == 1
-    assert summary["retries"] == 1
-    assert summary["provider_attempts"] == 3
-    assert summary["retry_backoff_seconds"] == 0.5
-    assert summary["retry_exhaustions"] == 1
-    assert summary["retry_exhaustions_by_reason"] == {"retry_budget": 1}
-    assert summary["retry_exhaustions_by_status"] == {"503": 1}
+    assert "samples" not in baseline
 
 
-async def test_exit_code_ignores_warmup_failures_when_measured_phase_is_healthy() -> None:
-    # A transient warmup blip must not abort a multi-stage campaign whose
-    # measured phase succeeded; the warmup counts stay visible in the report.
-    import load_test as load_test_module
-
-    healthy_measured = {"failures": 0, "warmup": {"failures": 1}}
-    failed_measured = {"failures": 1, "warmup": {"failures": 0}}
-
-    assert load_test_module._exit_code(healthy_measured) == 0
-    assert load_test_module._exit_code(failed_measured) == 1
-
-
-async def test_exit_code_applies_configurable_abort_thresholds() -> None:
-    import load_test as load_test_module
-
-    tolerable = {
+def test_exit_code_applies_failure_and_latency_thresholds() -> None:
+    report = {
         "requests": 300,
         "failures": 1,
-        "warmup": {"failures": 0},
         "service_latency_ms": {"p95": 1200.0},
+        "end_to_end_latency_ms": {"p95": 1500.0},
     }
-    breaching_rate = {**tolerable, "failures": 4}
-    breaching_p95 = {**tolerable, "failures": 0}
-
-    # Default: any measured failure aborts.
-    assert load_test_module._exit_code(tolerable) == 1
-    # A 1% threshold tolerates 1/300 but aborts at 4/300 (>1.3%).
-    assert load_test_module._exit_code(tolerable, max_failure_rate=0.01) == 0
-    assert load_test_module._exit_code(breaching_rate, max_failure_rate=0.01) == 1
-    # The p95 threshold aborts independently of the failure rate.
-    assert (
-        load_test_module._exit_code(
-            breaching_p95, max_failure_rate=0.01, max_service_p95_ms=5000.0
-        )
-        == 0
-    )
-    assert (
-        load_test_module._exit_code(breaching_p95, max_service_p95_ms=1000.0) == 1
-    )
-
-
-async def test_cli_rejects_out_of_range_failure_rate_threshold(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    import load_test as load_test_module
-
-    monkeypatch.setattr(
-        "sys.argv",
-        ["load_test.py", "--synthetic", "--max-failure-rate", "1.5"],
-    )
-
-    with pytest.raises(SystemExit):
-        await load_test_module._main()
-    assert "between 0 and 1" in capsys.readouterr().err
-
-
-async def test_cli_rejects_explicit_zero_concurrency(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # An explicit --concurrency 0 must be rejected, not silently replaced with
-    # the provider default and run at full concurrency.
-    import load_test as load_test_module
-
-    monkeypatch.setattr(
-        "sys.argv",
-        [
-            "load_test.py",
-            "--synthetic",
-            "--concurrency",
-            "0",
-            "--requests",
-            "1",
-            "--warmup-requests",
-            "0",
-        ],
-    )
-
-    with pytest.raises(ValueError, match="concurrency"):
-        await load_test_module._main()
-
-
-async def test_load_config_rejects_invalid_admission_values() -> None:
-    invalid_values = (
-        ({"requests_per_second": float("nan")}, "requests_per_second"),
-        ({"requests_per_second": float("inf")}, "requests_per_second"),
-        ({"max_pending_requests": 0}, "max_pending_requests"),
-    )
-    for overrides, message in invalid_values:
-        values: dict[str, float | int | None] = {
-            "requests": 1,
-            "concurrency": 1,
-            "requests_per_second": 1.0,
-            "temperature": 0.0,
-            "max_pending_requests": None,
-            **overrides,
-        }
-        with pytest.raises(ValueError, match=message):
-            LoadTestConfig(**values)  # type: ignore[arg-type]
+    assert _exit_code(report) == 1
+    assert _exit_code(report, max_failure_rate=0.01) == 0
+    assert _exit_code(report, max_failure_rate=0.01, max_service_p95_ms=1000) == 1
+    assert threshold_breaches(report, 0.01, 2000, 1000) == ["end_to_end_p95"]

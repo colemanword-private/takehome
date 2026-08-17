@@ -1,351 +1,201 @@
 SHELL := /bin/bash
-.DEFAULT_GOAL := help
-
-PROJECT_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
-PYTHON ?= $(PROJECT_DIR)/.venv/bin/python
-ENV_FILE ?= $(PROJECT_DIR)/.env
-
-# Select any provider registered in llm/providers.py. Model defaults live in each
-# provider's configuration; set MODEL to pin one explicitly (results are grouped
-# under "default" when unset).
-PROVIDER ?= gemini
-MODEL ?=
-PROVIDER_ARGS = --provider "$(PROVIDER)" $(if $(strip $(MODEL)),--model "$(MODEL)")
-
-# Resolve the timestamp once so every target in one Make invocation shares a run.
-# Override RUN_ID to group separate invocations into the same experiment campaign.
+PYTHON ?= .venv/bin/python
 RUN_ID ?= $(shell date -u +%Y%m%dT%H%M%SZ)
-RUN_ID := $(RUN_ID)
-LOAD_RESULTS_ROOT ?= $(PROJECT_DIR)/load-results
-EVAL_RESULTS_ROOT ?= $(PROJECT_DIR)/eval-results
+MODEL ?= gemini-2.5-flash
+LOAD_DIR := load-results/gemini/$(MODEL)/$(RUN_ID)
+EVAL_DIR := eval-results/gemini/$(MODEL)/$(RUN_ID)
+SYNTHETIC_DIR := load-results/synthetic/local/$(RUN_ID)
 
-# Keep each provider/model's runs together. Replace characters commonly used in
-# model IDs but unsuitable for a single directory component (for example, `/`).
-empty :=
-space := $(empty) $(empty)
-sanitize_path = $(subst $(space),-,$(subst /,-,$(subst :,-,$(subst @,-,$(strip $(1))))))
-PROVIDER_PATH = $(call sanitize_path,$(PROVIDER))
-MODEL_PATH = $(if $(strip $(MODEL)),$(call sanitize_path,$(MODEL)),default)
-LOAD_RESULTS_DIR ?= $(LOAD_RESULTS_ROOT)/$(PROVIDER_PATH)/$(MODEL_PATH)/$(RUN_ID)
-EVAL_RESULTS_DIR ?= $(EVAL_RESULTS_ROOT)/$(PROVIDER_PATH)/$(MODEL_PATH)/$(RUN_ID)
-SYNTHETIC_RESULTS_DIR ?= $(LOAD_RESULTS_ROOT)/synthetic/local/$(RUN_ID)
-
-# These controls are mapped by the selected provider rather than by this Makefile.
-TEMPERATURE ?= 0
-MAX_OUTPUT_TOKENS ?= 256
-THINKING_BUDGET ?=
-MAX_PENDING_REQUESTS ?=
-THINKING_BUDGET_ARG = $(if $(strip $(THINKING_BUDGET)),--thinking-budget "$(THINKING_BUDGET)")
-MAX_PENDING_REQUESTS_ARG = $(if $(strip $(MAX_PENDING_REQUESTS)),--max-pending-requests "$(MAX_PENDING_REQUESTS)")
-PROVIDER_CONTROL_ARGS = \
-	--max-output-tokens "$(MAX_OUTPUT_TOKENS)" \
-	$(THINKING_BUDGET_ARG)
-
-RAMP_RPS ?= 1 3 5 8 10
-RAMP_DURATION_SECONDS ?= 60
-RAMP_CONCURRENCY ?= 160
-# Cost and safety rails for the knee search. The ramp stops cleanly once the
-# measured-request budget is spent (the last stage is truncated to fit; the five
-# warmups per stage are not counted), and the first stage breaching either
-# threshold aborts the run. Set RAMP_REQUEST_BUDGET empty for an unbounded ramp.
-RAMP_REQUEST_BUDGET ?= 20000
+RAMP_RPS ?= 1 3 5 8 10 15 25 40 60 80 100 125 150 200 250 300 400
+RAMP_SECONDS ?= 30
 RAMP_MAX_FAILURE_RATE ?= 0.01
 RAMP_MAX_P95_MS ?= 5000
+RAMP_MAX_E2E_P95_MS ?= 5000
+CONCURRENCY ?= 96
+RETRY_RPS ?= 40
+OPERATING_RPS ?= 24
+OPERATING_SECONDS ?= 300
+MAX_OUTPUT_TOKENS ?= 256
+THINKING_BUDGET ?= 0
 
-# Set these only after the capacity ramp identifies a candidate operating point.
-RETRY_RPS ?=
-RETRY_DURATION_SECONDS ?= 60
-RETRY_CONCURRENCY ?= 160
-PRODUCTION_RETRIES ?= 4
+# Multi-process stages: the sharded bracket re-tests the single-process
+# saturation region with a client-clean generator; the probe hunts for the
+# quota/provider ceiling above it. 600 RPS is a deliberate hard stop on this
+# shared project, not a technical limit.
+BRACKET_RPS ?= 150 200 250 300
+BRACKET_SHARDS ?= 4
+PROBE_RPS ?= 400 500 600
+PROBE_SHARDS ?= 8
+SHARD_CONCURRENCY ?= 128
+MAX_SHARD_SCHED_P95_MS ?= 10
+DEMO_RPS ?= 600
+DEMO_SECONDS ?= 60
 
-SOAK_RPS ?=
-SOAK_DURATION_SECONDS ?= 900
-SOAK_CONCURRENCY ?= 160
+GEMINI_ARGS = --model "$(MODEL)" --max-output-tokens "$(MAX_OUTPUT_TOKENS)" \
+	--thinking-budget "$(THINKING_BUDGET)"
+LOAD_ARGS = $(GEMINI_ARGS) --concurrency "$(CONCURRENCY)" \
+	--workload load_test_workload.json --temperature 0
+MULTI_ARGS = $(GEMINI_ARGS) --shard-concurrency "$(SHARD_CONCURRENCY)" \
+	--workload load_test_workload.json --temperature 0 --warmup-requests 5
 
-# Load optional provider credentials and settings from .env without embedding any
-# Gemini-, Vertex-, or Together-specific variables in the experiment workflow.
-define LOAD_PROVIDER_ENV
-set -a; \
-if [ -f "$(ENV_FILE)" ]; then source "$(ENV_FILE)"; fi; \
-set +a;
+define RUN_WITH_ENV
+set -a; if [ -f .env ]; then source .env || exit 2; fi; set +a;
 endef
 
-.PHONY: \
-	help bootstrap check-python check-provider prepare-results test \
-	synthetic-smoke provider-smoke quality quality-baseline quality-controlled \
-	quality-factorial capacity-ramp retry-off retry-on soak evidence
+.PHONY: bootstrap test synthetic-smoke provider-smoke quality-factorial \
+	capacity-ramp operating-point retry-comparison evidence \
+	sharded-bracket quota-probe retries-demo
 
-# Print available workflows and common overrides. This sends no provider requests.
-help:
-	@printf '%s\n' \
-		'Local verification:' \
-		'  make bootstrap              Create/update .venv and result directories.' \
-		'  make test                   Run the offline unit test suite.' \
-		'  make synthetic-smoke        Exercise only the local load harness.' \
-		'  make check-provider         Validate local config and credentials.' \
-		'' \
-		'Provider experiments (billable):' \
-		'  make provider-smoke         Make one low-cost provider request.' \
-		'  make quality                Run baseline and controlled quality evals.' \
-		'  make quality-factorial      Run thinking x output-cap cells with repeats.' \
-		'  make evidence RUN_ID=...    Build the sanitized evidence manifest (free).' \
-		'  make capacity-ramp          Run staged load with retries off.' \
-		'  make retry-off RETRY_RPS=N  Measure the selected rate without retries.' \
-		'  make retry-on RETRY_RPS=N   Repeat it with production retries.' \
-		'  make soak SOAK_RPS=N        Hold an operating point for 15 minutes.' \
-		'' \
-		'Provider selection:' \
-		'  PROVIDER=gemini MODEL=gemini-2.5-flash' \
-		'  PROVIDER=together MODEL=organization/model' \
-		'' \
-		'Useful overrides:' \
-		'  RAMP_RPS="1 3 5" RAMP_CONCURRENCY=96 RAMP_DURATION_SECONDS=300' \
-		'  RAMP_REQUEST_BUDGET=20000  Stop the ramp once this many measured' \
-		'                             requests are spent (empty = unbounded).' \
-		'  RAMP_MAX_FAILURE_RATE=0.01 RAMP_MAX_P95_MS=5000  Abort the ramp at' \
-		'                             the first stage breaching either threshold.' \
-		'  MAX_OUTPUT_TOKENS=1024 THINKING_BUDGET=512 TEMPERATURE=0' \
-		'  MAX_PENDING_REQUESTS=256  Bound queued load-test arrivals.' \
-		'  RUN_ID=20260816T222927Z  Reuse one run directory across invocations.' \
-		'' \
-		'Results use <root>/<provider>/<model>/<RUN_ID>/ (synthetic uses synthetic/local).' \
-		'These scratch roots remain ignored by git. Review and redact artifacts' \
-		'before copying curated results into an evidence/ directory.'
-
-# Create the virtual environment if needed, install dependencies, and create result
-# roots. This may contact the package index, but it sends no LLM requests.
 bootstrap:
-	@command -v "$(PYTHON)" >/dev/null 2>&1 || python3 -m venv "$(PROJECT_DIR)/.venv"
-	@"$(PYTHON)" -m pip install -r "$(PROJECT_DIR)/requirements.txt"
-	@mkdir -p "$(LOAD_RESULTS_ROOT)" "$(EVAL_RESULTS_ROOT)"
+	@test -x "$(PYTHON)" || python3 -m venv .venv
+	@"$(PYTHON)" -m pip install -r requirements.txt
 
-# Fail with setup guidance when the configured Python executable is unavailable.
-check-python:
-	@test -x "$(PYTHON)" || { \
-		echo 'Python environment is missing; run `make bootstrap` first.' >&2; \
-		exit 1; \
-	}
+test:
+	@"$(PYTHON)" -m pytest -q
 
-# Delegate configuration and credential validation to the selected provider. This
-# performs configuration and credential discovery but sends no inference request.
-check-provider: check-python
-	@set -eu; \
-	$(LOAD_PROVIDER_ENV) \
-	"$(PYTHON)" "$(PROJECT_DIR)/provider_check.py" $(PROVIDER_ARGS)
+synthetic-smoke:
+	@mkdir -p "$(SYNTHETIC_DIR)"
+	@"$(PYTHON)" load_test.py --synthetic --requests 10000 --rps 0 \
+		--concurrency 128 --warmup-requests 0 \
+		--output "$(SYNTHETIC_DIR)/00-synthetic-smoke.json"
 
-# Create this invocation's timestamped output directories.
-prepare-results:
-	@mkdir -p "$(LOAD_RESULTS_DIR)" "$(EVAL_RESULTS_DIR)" "$(SYNTHETIC_RESULTS_DIR)"
+provider-smoke:
+	@mkdir -p "$(LOAD_DIR)"
+	@$(RUN_WITH_ENV) "$(PYTHON)" load_test.py $(LOAD_ARGS) --max-retries 0 \
+		--requests 1 --rps 1 --concurrency 1 --warmup-requests 0 \
+		--output "$(LOAD_DIR)/01-gemini-smoke.json"
 
-# Run the complete offline unit suite. Tests use fakes and send no provider requests.
-test: check-python
-	@cd "$(PROJECT_DIR)" && "$(PYTHON)" -m pytest -q
-
-# Stress the local scheduler with synthetic responses and save a timestamped report.
-# This validates harness behavior, not any external provider's latency or capacity.
-synthetic-smoke: check-python prepare-results
-	@"$(PYTHON)" "$(PROJECT_DIR)/load_test.py" \
-		--synthetic \
-		--requests 10000 \
-		--rps 0 \
-		--concurrency 128 \
-		$(MAX_PENDING_REQUESTS_ARG) \
-		--warmup-requests 0 \
-		--temperature "$(TEMPERATURE)" \
-		--output "$(SYNTHETIC_RESULTS_DIR)/00-synthetic-smoke.json"
-
-# BILLABLE: send one bounded request through the selected provider to verify auth,
-# request mapping, and result persistence before starting larger experiments.
-provider-smoke: check-provider prepare-results
-	@set -eu; \
-	$(LOAD_PROVIDER_ENV) \
-	"$(PYTHON)" "$(PROJECT_DIR)/load_test.py" \
-		$(PROVIDER_ARGS) \
-		$(PROVIDER_CONTROL_ARGS) \
-		--max-retries 0 \
-		--requests 1 \
-		--rps 1 \
-		--concurrency 1 \
-		$(MAX_PENDING_REQUESTS_ARG) \
-		--warmup-requests 0 \
-		--temperature "$(TEMPERATURE)" \
-		--output "$(LOAD_RESULTS_DIR)/01-$(PROVIDER)-smoke.json"
-
-# BILLABLE: run both quality evaluations to compare environment-configured behavior
-# with explicit supported controls for the selected provider. A baseline failure must
-# not skip the controlled run, or the paired comparison is lost after billable spend;
-# RUN_ID is forwarded so both sub-makes share one run directory.
-quality:
-	@status=0; \
-	$(MAKE) quality-baseline RUN_ID="$(RUN_ID)" || status=1; \
-	$(MAKE) quality-controlled RUN_ID="$(RUN_ID)" || status=1; \
-	exit $$status
-
-# BILLABLE: evaluate all golden cases with retries disabled and otherwise use the
-# selected provider's environment-configured defaults.
-quality-baseline: check-provider prepare-results
-	@set -eu; \
-	$(LOAD_PROVIDER_ENV) \
-	"$(PYTHON)" "$(PROJECT_DIR)/quality_eval.py" \
-		$(PROVIDER_ARGS) \
-		--max-retries 0 \
-		--concurrency 2 \
-		--output "$(EVAL_RESULTS_DIR)/02-$(PROVIDER)-quality-baseline.json"
-
-# Factorial quality experiment: thinking {default, 0} x output-cap {none, 256},
-# FACTORIAL_REPEATS runs per cell. "default" and "none" omit the control so the
-# provider's own default applies.
-FACTORIAL_REPEATS ?= 3
-FACTORIAL_THINKING ?= default 0
-FACTORIAL_MAX_OUTPUT ?= none 256
-
-# BILLABLE: run every factorial cell as an independent quality evaluation with
-# its own artifact. A failing cell does not skip the remaining cells; the
-# combined exit status stays nonzero so the failure is still visible.
-quality-factorial: check-provider prepare-results
-	@set -eu; \
-	$(LOAD_PROVIDER_ENV) \
-	status=0; \
-	for thinking in $(FACTORIAL_THINKING); do \
-		for cap in $(FACTORIAL_MAX_OUTPUT); do \
-			for repeat in $$(seq 1 $(FACTORIAL_REPEATS)); do \
-				cell_args=""; \
-				if [ "$$thinking" != "default" ]; then cell_args="$$cell_args --thinking-budget $$thinking"; fi; \
-				if [ "$$cap" != "none" ]; then cell_args="$$cell_args --max-output-tokens $$cap"; fi; \
-				output="$(EVAL_RESULTS_DIR)/02-$(PROVIDER)-quality-think-$$thinking-cap-$$cap-r$$repeat.json"; \
-				echo "Quality cell thinking=$$thinking cap=$$cap repeat=$$repeat..."; \
-				"$(PYTHON)" "$(PROJECT_DIR)/quality_eval.py" \
-					$(PROVIDER_ARGS) \
-					$$cell_args \
-					--max-retries 0 \
-					--concurrency 2 \
-					--output "$$output" || status=1; \
+quality-factorial:
+	@mkdir -p "$(EVAL_DIR)"
+	@$(RUN_WITH_ENV) status=0; \
+	for thinking in default 0; do \
+		for cap in none 256; do \
+			for repeat in 1 2 3; do \
+				"$(PYTHON)" quality_eval.py --model "$(MODEL)" \
+					--thinking-budget "$$thinking" --max-output-tokens "$$cap" \
+					--output "$(EVAL_DIR)/quality-think-$$thinking-cap-$$cap-r$$repeat.json" \
+					|| status=1; \
 			done; \
 		done; \
-	done; \
-	exit $$status
+	done; exit $$status
 
-# BILLABLE: repeat the golden cases with explicit supported controls and no retries,
-# so quality, token, and latency changes remain directly observable.
-quality-controlled: check-provider prepare-results
-	@set -eu; \
-	$(LOAD_PROVIDER_ENV) \
-	"$(PYTHON)" "$(PROJECT_DIR)/quality_eval.py" \
-		$(PROVIDER_ARGS) \
-		$(PROVIDER_CONTROL_ARGS) \
-		--max-retries 0 \
-		--concurrency 2 \
-		--output "$(EVAL_RESULTS_DIR)/03-$(PROVIDER)-quality-controlled.json"
-
-# BILLABLE: step through RAMP_RPS for RAMP_DURATION_SECONDS per stage, with five
-# warmups and retries disabled. The run ends at the first stage breaching
-# RAMP_MAX_FAILURE_RATE or RAMP_MAX_P95_MS, or cleanly once RAMP_REQUEST_BUDGET
-# is spent; inspect the last stage's report either way.
-capacity-ramp: check-provider prepare-results
-	@set -eu; \
-	$(LOAD_PROVIDER_ENV) \
-	remaining="$(strip $(RAMP_REQUEST_BUDGET))"; \
+capacity-ramp:
+	@mkdir -p "$(LOAD_DIR)"
+	@$(RUN_WITH_ENV) set -eu; shopt -s nullglob; \
+	previous_reports=("$(LOAD_DIR)"/capacity-*.json); \
+	if [ $${#previous_reports[@]} -gt 0 ]; then \
+		archive="$(LOAD_DIR)/.superseded-capacity-$$(date -u +%Y%m%dT%H%M%SZ)-$$$$"; \
+		mkdir "$$archive"; \
+		mv "$${previous_reports[@]}" "$$archive/"; \
+	fi; \
+	boundary_reached=0; \
 	for rps in $(RAMP_RPS); do \
-		requests=$$((rps * $(RAMP_DURATION_SECONDS))); \
-		if [ -n "$$remaining" ]; then \
-			if [ "$$remaining" -le 0 ]; then \
-				echo "Stopping: RAMP_REQUEST_BUDGET exhausted before the $$rps RPS stage." >&2; \
-				break; \
-			fi; \
-			if [ "$$requests" -gt "$$remaining" ]; then requests="$$remaining"; fi; \
-			remaining=$$((remaining - requests)); \
-		fi; \
-		output="$(LOAD_RESULTS_DIR)/04-$(PROVIDER)-capacity-$${rps}rps.json"; \
-		echo "Running $$requests requests against $(PROVIDER) at $$rps RPS..."; \
-		"$(PYTHON)" "$(PROJECT_DIR)/load_test.py" \
-			$(PROVIDER_ARGS) \
-			$(PROVIDER_CONTROL_ARGS) \
-			--max-retries 0 \
+		requests=$$((rps * $(RAMP_SECONDS))); \
+		output="$(LOAD_DIR)/capacity-$${rps}rps.json"; \
+		tmp_output="$${output}.tmp.$$$$"; \
+		test ! -e "$$tmp_output" || exit 2; \
+		set +e; \
+		"$(PYTHON)" load_test.py $(LOAD_ARGS) --max-retries 0 \
+			--requests "$$requests" --rps "$$rps" --warmup-requests 5 \
 			--max-failure-rate "$(RAMP_MAX_FAILURE_RATE)" \
 			--max-service-p95-ms "$(RAMP_MAX_P95_MS)" \
-			--requests "$$requests" \
-			--rps "$$rps" \
-			--concurrency "$(RAMP_CONCURRENCY)" \
-			$(MAX_PENDING_REQUESTS_ARG) \
-			--warmup-requests 5 \
-			--temperature "$(TEMPERATURE)" \
-			--output "$$output" || { \
-				echo "Stopping: the $$rps RPS stage breached the abort criterion; see $$output." >&2; \
-				exit 1; \
-			}; \
+			--max-end-to-end-p95-ms "$(RAMP_MAX_E2E_P95_MS)" \
+			--output "$$tmp_output"; \
+		status=$$?; set -e; \
+		if [ $$status -eq 0 ] || [ $$status -eq 1 ]; then \
+			test -f "$$tmp_output" || exit 2; \
+			mv "$$tmp_output" "$$output"; \
+		fi; \
+		if [ $$status -eq 1 ]; then \
+			if "$(PYTHON)" -c 'import json, sys; report = json.load(open(sys.argv[1])); sys.exit(not report["acceptance"]["breaches"])' "$$output"; then \
+				echo "Capacity boundary reached at $${rps} RPS; stopping ramp."; \
+				boundary_reached=1; break; \
+			fi; \
+			exit $$status; \
+		elif [ $$status -ne 0 ]; then \
+			exit $$status; \
+		fi; \
+	done; \
+	if [ $$boundary_reached -ne 1 ]; then \
+		echo "No capacity boundary found in configured RAMP_RPS stages." >&2; \
+		exit 2; \
+	fi
+
+operating-point:
+	@mkdir -p "$(LOAD_DIR)"
+	@$(RUN_WITH_ENV) requests=$$(( $(OPERATING_RPS) * $(OPERATING_SECONDS) )); \
+	"$(PYTHON)" load_test.py $(LOAD_ARGS) --max-retries 4 \
+		--requests "$$requests" --rps "$(OPERATING_RPS)" --warmup-requests 10 \
+		--max-failure-rate "$(RAMP_MAX_FAILURE_RATE)" \
+		--max-service-p95-ms "$(RAMP_MAX_P95_MS)" \
+		--max-end-to-end-p95-ms "$(RAMP_MAX_E2E_P95_MS)" \
+		--output "$(LOAD_DIR)/operating-point-$(OPERATING_RPS)rps.json"
+
+retry-comparison:
+	@mkdir -p "$(LOAD_DIR)"
+	@$(RUN_WITH_ENV) for retries in 0 4; do \
+		requests=$$(( $(RETRY_RPS) * $(RAMP_SECONDS) )); \
+		"$(PYTHON)" load_test.py $(LOAD_ARGS) --max-retries "$$retries" \
+			--requests "$$requests" --rps "$(RETRY_RPS)" --warmup-requests 5 \
+			--max-failure-rate 1 \
+			--output "$(LOAD_DIR)/retry-$${retries}-$(RETRY_RPS)rps.json" || exit 1; \
 	done
 
-# BILLABLE: measure RETRY_RPS with retries disabled to establish the unamplified
-# failure rate before testing a production retry policy.
-retry-off: check-provider prepare-results
-	@set -eu; \
-	$(LOAD_PROVIDER_ENV) \
-	test -n "$(strip $(RETRY_RPS))" || { \
-		echo 'Set RETRY_RPS to a rate selected from the capacity ramp.' >&2; \
-		exit 1; \
-	}; \
-	requests=$$(( $(RETRY_RPS) * $(RETRY_DURATION_SECONDS) )); \
-	"$(PYTHON)" "$(PROJECT_DIR)/load_test.py" \
-		$(PROVIDER_ARGS) \
-		$(PROVIDER_CONTROL_ARGS) \
-		--max-retries 0 \
-		--requests "$$requests" \
-		--rps "$(RETRY_RPS)" \
-		--concurrency "$(RETRY_CONCURRENCY)" \
-		$(MAX_PENDING_REQUESTS_ARG) \
-		--warmup-requests 5 \
-		--temperature "$(TEMPERATURE)" \
-		--output "$(LOAD_RESULTS_DIR)/05-$(PROVIDER)-retry-off-$(RETRY_RPS)rps.json"
+# Stops at the first breached stage; a clean top-out is a valid result for
+# both multi-process campaigns (unlike capacity-ramp, which must find a
+# boundary).
+sharded-bracket:
+	@mkdir -p "$(LOAD_DIR)"
+	@$(RUN_WITH_ENV) for rps in $(BRACKET_RPS); do \
+		requests=$$((rps * $(RAMP_SECONDS))); \
+		set +e; \
+		"$(PYTHON)" multi_load.py $(MULTI_ARGS) --max-retries 0 \
+			--shards "$(BRACKET_SHARDS)" --total-rps "$$rps" \
+			--requests "$$requests" \
+			--max-failure-rate "$(RAMP_MAX_FAILURE_RATE)" \
+			--max-service-p95-ms "$(RAMP_MAX_P95_MS)" \
+			--max-end-to-end-p95-ms "$(RAMP_MAX_E2E_P95_MS)" \
+			--max-shard-scheduler-p95-ms "$(MAX_SHARD_SCHED_P95_MS)" \
+			--output "$(LOAD_DIR)/bracket-$${rps}rps.json"; \
+		status=$$?; set -e; \
+		if [ $$status -eq 1 ]; then \
+			echo "Bracket breach at $${rps} RPS; stopping."; break; \
+		elif [ $$status -ne 0 ]; then \
+			exit $$status; \
+		fi; \
+	done
 
-# BILLABLE: repeat RETRY_RPS with PRODUCTION_RETRIES so availability, latency, and
-# extra attempts can be compared directly with the retry-off artifact.
-retry-on: check-provider prepare-results
-	@set -eu; \
-	$(LOAD_PROVIDER_ENV) \
-	test -n "$(strip $(RETRY_RPS))" || { \
-		echo 'Set RETRY_RPS to a rate selected from the capacity ramp.' >&2; \
-		exit 1; \
-	}; \
-	requests=$$(( $(RETRY_RPS) * $(RETRY_DURATION_SECONDS) )); \
-	"$(PYTHON)" "$(PROJECT_DIR)/load_test.py" \
-		$(PROVIDER_ARGS) \
-		$(PROVIDER_CONTROL_ARGS) \
-		--max-retries "$(PRODUCTION_RETRIES)" \
-		--requests "$$requests" \
-		--rps "$(RETRY_RPS)" \
-		--concurrency "$(RETRY_CONCURRENCY)" \
-		$(MAX_PENDING_REQUESTS_ARG) \
-		--warmup-requests 5 \
-		--temperature "$(TEMPERATURE)" \
-		--output "$(LOAD_RESULTS_DIR)/06-$(PROVIDER)-retry-on-$(RETRY_RPS)rps.json"
+quota-probe:
+	@mkdir -p "$(LOAD_DIR)"
+	@$(RUN_WITH_ENV) for rps in $(PROBE_RPS); do \
+		requests=$$((rps * $(RAMP_SECONDS))); \
+		set +e; \
+		"$(PYTHON)" multi_load.py $(MULTI_ARGS) --max-retries 0 \
+			--shards "$(PROBE_SHARDS)" --total-rps "$$rps" \
+			--requests "$$requests" \
+			--max-failure-rate "$(RAMP_MAX_FAILURE_RATE)" \
+			--max-service-p95-ms "$(RAMP_MAX_P95_MS)" \
+			--max-end-to-end-p95-ms "$(RAMP_MAX_E2E_P95_MS)" \
+			--max-shard-scheduler-p95-ms "$(MAX_SHARD_SCHED_P95_MS)" \
+			--output "$(LOAD_DIR)/probe-$${rps}rps.json"; \
+		status=$$?; set -e; \
+		if [ $$status -eq 1 ]; then \
+			echo "Probe breach at $${rps} RPS; stopping."; break; \
+		elif [ $$status -ne 0 ]; then \
+			exit $$status; \
+		fi; \
+	done
 
-# BILLABLE: hold SOAK_RPS for SOAK_DURATION_SECONDS to expose sustained latency,
-# queueing, credential-refresh, or resource problems at the chosen operating point.
-soak: check-provider prepare-results
-	@set -eu; \
-	$(LOAD_PROVIDER_ENV) \
-	test -n "$(strip $(SOAK_RPS))" || { \
-		echo 'Set SOAK_RPS to roughly 60-70% of the measured capacity knee.' >&2; \
-		exit 1; \
-	}; \
-	requests=$$(( $(SOAK_RPS) * $(SOAK_DURATION_SECONDS) )); \
-	"$(PYTHON)" "$(PROJECT_DIR)/load_test.py" \
-		$(PROVIDER_ARGS) \
-		$(PROVIDER_CONTROL_ARGS) \
-		--max-retries "$(PRODUCTION_RETRIES)" \
-		--requests "$$requests" \
-		--rps "$(SOAK_RPS)" \
-		--concurrency "$(SOAK_CONCURRENCY)" \
-		$(MAX_PENDING_REQUESTS_ARG) \
-		--warmup-requests 5 \
-		--temperature "$(TEMPERATURE)" \
-		--output "$(LOAD_RESULTS_DIR)/07-$(PROVIDER)-soak-$(SOAK_RPS)rps.json"
+# Observational: production retry settings at the breaching (or top) rate,
+# with no acceptance rails so the stage always completes and reports.
+retries-demo:
+	@mkdir -p "$(LOAD_DIR)"
+	@$(RUN_WITH_ENV) requests=$$(( $(DEMO_RPS) * $(DEMO_SECONDS) )); \
+	"$(PYTHON)" multi_load.py $(MULTI_ARGS) --max-retries 4 \
+		--shards "$(PROBE_SHARDS)" --total-rps "$(DEMO_RPS)" \
+		--requests "$$requests" --max-failure-rate 1 \
+		--max-shard-scheduler-p95-ms 100000 \
+		--output "$(LOAD_DIR)/retries-demo-$(DEMO_RPS)rps.json"
 
-# Aggregate one run's raw artifacts into the sanitized, checksummed evidence
-# manifest that is safe to commit. Sends no provider requests.
-evidence: check-python
-	@"$(PYTHON)" "$(PROJECT_DIR)/evidence_manifest.py" \
-		--run-id "$(RUN_ID)" \
-		--provider-dir "$(PROVIDER_PATH)" \
-		--model-dir "$(MODEL_PATH)" \
-		--project-dir "$(PROJECT_DIR)"
+evidence:
+	@"$(PYTHON)" evidence_summary.py --run-id "$(RUN_ID)" --model "$(MODEL)"

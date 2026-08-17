@@ -1,283 +1,30 @@
-from __future__ import annotations
-
-import asyncio
-import importlib.metadata
-import math
 import os
-import random
-from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from together import AsyncTogether
+from together.types.chat.completion_create_params import MessageChatCompletionUserMessageParam, MessageChatCompletionSystemMessageParam
 
-import httpx
-from together import (
-    APIConnectionError,
-    APIError,
-    APIStatusError,
-    AsyncTogether,
-)
-from together.types.chat.completion_create_params import (
-    MessageChatCompletionSystemMessageParam,
-    MessageChatCompletionUserMessageParam,
-)
-
-from ._env import env_float, env_int, env_optional_int
-from .llm import LLM, LLMResponseError
-from .retry import (
-    RETRYABLE_STATUS_CODES,
-    BackoffEvent,
-    RetryBudget,
-    RetryEvent,
-    RetryExhaustedEvent,
-    RetryPolicy,
-    retry_after_seconds,
-    retry_with_backoff,
-    status_code_from_error,
-)
-_TRANSPORT_ERRORS = (TimeoutError, ConnectionError, httpx.TransportError)
-_HANDLED_ERRORS = (APIError, *_TRANSPORT_ERRORS)
-
-
-class TogetherResponseError(LLMResponseError):
-    """Raised when Together returns a response without usable answer text."""
-
-
-@dataclass(frozen=True)
-class TogetherConfig:
-    """Runtime controls for the Together provider."""
-
-    model: str
-    parallelism: int = 100
-    max_retries: int = 2
-    retry_base_delay_seconds: float = 0.5
-    retry_max_delay_seconds: float = 8.0
-    max_output_tokens: int | None = None
-    timeout_seconds: float = 20.0
-    request_deadline_seconds: float = 60.0
-    retry_budget_capacity: int = 32
-    retry_budget_refill_per_second: float = 2.0
-
-    @classmethod
-    def from_env(cls, *, model: str | None = None) -> TogetherConfig:
-        resolved_model = model or os.getenv("TOGETHER_MODEL")
-        if not resolved_model:
-            raise ValueError("--model or TOGETHER_MODEL is required for Together")
-        return cls(
-            model=resolved_model,
-            parallelism=env_int("TOGETHER_PARALLELISM", 100, minimum=1),
-            max_retries=env_int("TOGETHER_MAX_RETRIES", 2, minimum=0),
-            retry_base_delay_seconds=env_float(
-                "TOGETHER_RETRY_BASE_DELAY_SECONDS", 0.5, minimum=0.0
-            ),
-            retry_max_delay_seconds=env_float(
-                "TOGETHER_RETRY_MAX_DELAY_SECONDS", 8.0, minimum=0.0
-            ),
-            max_output_tokens=env_optional_int(
-                "TOGETHER_MAX_OUTPUT_TOKENS", minimum=1
-            ),
-            timeout_seconds=env_float(
-                "TOGETHER_TIMEOUT_SECONDS", 20.0, minimum=0.001
-            ),
-            request_deadline_seconds=env_float(
-                "TOGETHER_REQUEST_DEADLINE_SECONDS", 60.0, minimum=0.001
-            ),
-            retry_budget_capacity=env_int(
-                "TOGETHER_RETRY_BUDGET_CAPACITY", 32, minimum=1
-            ),
-            retry_budget_refill_per_second=env_float(
-                "TOGETHER_RETRY_BUDGET_REFILL_PER_SECOND", 2.0, minimum=0.0
-            ),
-        )
-
-    def __post_init__(self) -> None:
-        if not self.model:
-            raise ValueError("model must not be empty")
-        if self.parallelism < 1:
-            raise ValueError("parallelism must be at least 1")
-        RetryPolicy(
-            max_retries=self.max_retries,
-            base_delay_seconds=self.retry_base_delay_seconds,
-            max_delay_seconds=self.retry_max_delay_seconds,
-        )
-        if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be finite and positive")
-        if (
-            not math.isfinite(self.request_deadline_seconds)
-            or self.request_deadline_seconds <= 0
-        ):
-            raise ValueError("request_deadline_seconds must be finite and positive")
-        if self.retry_budget_capacity < 1:
-            raise ValueError("retry_budget_capacity must be at least 1")
-        if (
-            not math.isfinite(self.retry_budget_refill_per_second)
-            or self.retry_budget_refill_per_second < 0
-        ):
-            raise ValueError(
-                "retry_budget_refill_per_second must be finite and non-negative"
-            )
-        if self.max_output_tokens is not None and self.max_output_tokens < 1:
-            raise ValueError("max_output_tokens must be positive")
-
+from llm import LLM
 
 class Together(LLM):
-    def __init__(
-        self,
-        model: str | None = None,
-        *,
-        config: TogetherConfig | None = None,
-        client: AsyncTogether | None = None,
-        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-        jitter: Callable[[float, float], float] = random.uniform,
-        on_backoff: Callable[[BackoffEvent], None] | None = None,
-        on_retry: Callable[[RetryEvent], None] | None = None,
-        on_exhausted: Callable[[RetryExhaustedEvent], None] | None = None,
-    ) -> None:
-        if config is not None and model is not None:
-            raise ValueError("pass either model or config, not both")
-        self._config = config or TogetherConfig.from_env(model=model)
-        api_key = os.getenv("TOGETHER_API_KEY")
-        if client is None and not api_key:
-            raise ValueError("TOGETHER_API_KEY must be set")
+    def __init__(self):
+        self.__client = AsyncTogether(api_key=os.getenv("TOGETHER_API_KEY"))
+        self.__model = os.getenv("TOGETHER_MODEL")
 
-        # Disable SDK retries so all providers use the same observable retry layer.
-        self._client = client or AsyncTogether(
-            api_key=api_key,
-            max_retries=0,
-            timeout=self._config.timeout_seconds,
+    def parallelism(self):
+        return 100
+
+    async def ask_generic_question(self, system_prompt: str, question: str, temperature: float) -> LLM.SimpleResponse:
+        response = await self.__client.chat.completions.create(
+            model=self.__model,
+            messages=[
+                MessageChatCompletionUserMessageParam(role="user", content=question),
+                MessageChatCompletionSystemMessageParam(role="system", content=system_prompt),
+            ],
+            logprobs=1,
+            temperature=temperature,
         )
-        self._retry_policy = RetryPolicy(
-            max_retries=self._config.max_retries,
-            base_delay_seconds=self._config.retry_base_delay_seconds,
-            max_delay_seconds=self._config.retry_max_delay_seconds,
-        )
-        self._retry_budget = RetryBudget(
-            capacity=self._config.retry_budget_capacity,
-            refill_rate_per_second=self._config.retry_budget_refill_per_second,
-        )
-        self._sleep = sleep
-        self._jitter = jitter
-        self._on_backoff = on_backoff
-        self._on_retry = on_retry
-        self._on_exhausted = on_exhausted
-        self._closed = False
 
-    def parallelism(self) -> int:
-        return self._config.parallelism
-
-    def metadata(self) -> dict[str, object]:
-        return {
-            "provider": "Together",
-            "model": self._config.model,
-            "parallelism": self._config.parallelism,
-            "timeout_seconds": self._config.timeout_seconds,
-            "timeout_scope": "per_attempt",
-            "request_deadline_seconds": self._config.request_deadline_seconds,
-            "max_retries": self._config.max_retries,
-            "retry_base_delay_seconds": self._config.retry_base_delay_seconds,
-            "retry_max_delay_seconds": self._config.retry_max_delay_seconds,
-            "retry_budget_capacity": self._config.retry_budget_capacity,
-            "retry_budget_refill_per_second": (
-                self._config.retry_budget_refill_per_second
-            ),
-            "max_output_tokens": self._config.max_output_tokens,
-            # Each provider reports its own SDK versions so benchmark artifacts
-            # stay reproducible without the harness hardcoding package names.
-            "dependencies": {
-                name: importlib.metadata.version(name)
-                for name in ("together", "httpx")
-            },
-        }
-
-    async def ask_generic_question(
-        self, system_prompt: str, question: str, temperature: float
-    ) -> LLM.SimpleResponse:
-        if self._closed:
-            raise RuntimeError("Together client is closed")
-        if not 0.0 <= temperature <= 2.0:
-            raise ValueError("temperature must be between 0.0 and 2.0")
-
-        async def create_completion() -> Any:
-            request: dict[str, Any] = {
-                "model": self._config.model,
-                "messages": [
-                    MessageChatCompletionSystemMessageParam(
-                        role="system", content=system_prompt
-                    ),
-                    MessageChatCompletionUserMessageParam(
-                        role="user", content=question
-                    ),
-                ],
-                "temperature": temperature,
-            }
-            if self._config.max_output_tokens is not None:
-                request["max_tokens"] = self._config.max_output_tokens
-            # The SDK timeout controls transport inactivity; this enforces the
-            # configured wall-clock limit for the complete provider attempt.
-            return await asyncio.wait_for(
-                self._client.chat.completions.create(**request),
-                timeout=self._config.timeout_seconds,
-            )
-
-        response = await retry_with_backoff(
-            create_completion,
-            policy=self._retry_policy,
-            handled_errors=_HANDLED_ERRORS,
-            is_retryable=_is_retryable,
-            status_code=status_code_from_error,
-            retry_after=retry_after_seconds,
-            retry_budget=self._retry_budget,
-            total_timeout_seconds=self._config.request_deadline_seconds,
-            sleep=self._sleep,
-            jitter=self._jitter,
-            on_backoff=self._on_backoff,
-            on_retry=self._on_retry,
-            on_exhausted=self._on_exhausted,
-        )
-        input_tokens, output_tokens = _token_counts(response)
-        choices = getattr(response, "choices", None) or []
-        message = getattr(choices[0], "message", None) if choices else None
-        answer = getattr(message, "content", None)
-        if not isinstance(answer, str) or not answer:
-            raise TogetherResponseError(
-                "Together returned no text",
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-            )
         return LLM.SimpleResponse(
-            answer=answer,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
+            answer=response.choices[0].message.content,
+            input_tokens=response.usage.prompt_tokens,
+            output_tokens=response.usage.completion_tokens,
         )
-
-    async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        await self._client.close()
-
-
-def check_together_readiness(model: str | None = None) -> dict[str, object]:
-    """Validate local Together configuration without sending a provider request."""
-    config = TogetherConfig.from_env(model=model)
-    if not os.getenv("TOGETHER_API_KEY"):
-        raise ValueError("TOGETHER_API_KEY must be set")
-    return {"provider": "together", "model": config.model, "credentials": "found"}
-
-
-def _token_counts(response: Any) -> tuple[int, int]:
-    usage = getattr(response, "usage", None)
-    if usage is None:
-        return 0, 0
-    return (
-        int(getattr(usage, "prompt_tokens", 0) or 0),
-        int(getattr(usage, "completion_tokens", 0) or 0),
-    )
-
-
-def _is_retryable(error: BaseException) -> bool:
-    if isinstance(error, (APIConnectionError, *_TRANSPORT_ERRORS)):
-        return True
-    if isinstance(error, APIStatusError):
-        return status_code_from_error(error) in RETRYABLE_STATUS_CODES
-    return False
-
-
