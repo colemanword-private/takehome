@@ -14,6 +14,26 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
+# Retrying other 4xx responses would amplify permanent configuration or prompt errors.
+RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
+
+
+def status_code_from_error(error: BaseException) -> int | None:
+    """Extract an HTTP status across provider SDK error shapes.
+
+    Numeric attributes are probed before `status` because some SDKs
+    (google-genai) populate `status` with text such as "RESOURCE_EXHAUSTED".
+    """
+    for name in ("code", "status_code", "status"):
+        value = getattr(error, name, None)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
 
 def _no_status_code(_: BaseException) -> None:
     return None

@@ -78,7 +78,9 @@ async def test_load_test_enforces_concurrency_and_reports_failures() -> None:
     assert summary["provider"] == {"provider": "FakeProvider"}
     assert summary["workload"]["question_count"] == 2
     assert len(summary["workload"]["sha256"]) == 64
-    assert summary["runtime"]["dependencies"]["google-genai"] == "2.13.0"
+    # Dependency versions are provider-owned metadata; the shared runtime block
+    # records only the interpreter and platform.
+    assert set(summary["runtime"]) == {"python", "platform"}
     assert summary["retries"] is None
     assert summary["queue_capacity"] == 12
     assert summary["max_queue_depth"] <= summary["queue_capacity"]
@@ -90,6 +92,72 @@ async def test_load_test_enforces_concurrency_and_reports_failures() -> None:
         "queue_capacity": 12,
         "max_queue_depth": 0,
     }
+
+
+async def test_failed_requests_count_tokens_only_from_declared_response_errors() -> None:
+    from llm import LLMResponseError
+
+    class BilledFailureProvider(FakeProvider):
+        async def ask_generic_question(
+            self, system_prompt: str, question: str, temperature: float
+        ) -> LLM.SimpleResponse:
+            raise LLMResponseError("no usable text", input_tokens=7, output_tokens=3)
+
+    class UndeclaredBilledError(RuntimeError):
+        input_tokens = 7
+        output_tokens = 3
+
+    class UndeclaredFailureProvider(FakeProvider):
+        async def ask_generic_question(
+            self, system_prompt: str, question: str, temperature: float
+        ) -> LLM.SimpleResponse:
+            raise UndeclaredBilledError("boom")
+
+    config = LoadTestConfig(
+        requests=1, concurrency=1, requests_per_second=0, temperature=0.0
+    )
+    workload = Workload("system", ("one",))
+
+    declared = await run_load_test(BilledFailureProvider(), workload, config)
+    undeclared = await run_load_test(UndeclaredFailureProvider(), workload, config)
+
+    assert declared["observed_input_tokens"] == 7
+    assert declared["observed_output_tokens"] == 3
+    # Attributes on an undeclared exception type are not billing telemetry.
+    assert undeclared["observed_input_tokens"] == 0
+    assert undeclared["observed_output_tokens"] == 0
+
+
+async def test_failure_modes_classify_real_genai_rate_limit() -> None:
+    from google.genai import errors
+
+    class RateLimitedProvider(FakeProvider):
+        async def ask_generic_question(
+            self, system_prompt: str, question: str, temperature: float
+        ) -> LLM.SimpleResponse:
+            raise errors.ClientError(
+                429,
+                {
+                    "error": {
+                        "code": 429,
+                        "status": "RESOURCE_EXHAUSTED",
+                        "message": "quota exceeded",
+                    }
+                },
+            )
+
+    summary = await run_load_test(
+        RateLimitedProvider(),
+        Workload("system", ("one",)),
+        LoadTestConfig(
+            requests=1,
+            concurrency=1,
+            requests_per_second=0,
+            temperature=0.0,
+        ),
+    )
+
+    assert summary["failure_modes"] == {"http_429": 1}
 
 
 async def test_cancellation_cleans_up_in_flight_workers() -> None:
@@ -323,6 +391,68 @@ async def test_load_report_includes_retry_attempt_and_exhaustion_telemetry() -> 
     assert summary["retry_exhaustions"] == 1
     assert summary["retry_exhaustions_by_reason"] == {"retry_budget": 1}
     assert summary["retry_exhaustions_by_status"] == {"503": 1}
+
+
+async def test_cli_reports_unsupported_control_cleanly(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # An unsupported control must exit with a clean usage error before any
+    # billable work, not an unhandled traceback.
+    import load_test as load_test_module
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "load_test.py",
+            "--provider",
+            "together",
+            "--model",
+            "organization/model",
+            "--thinking-budget",
+            "0",
+        ],
+    )
+
+    assert await load_test_module._main() == 2
+    assert "thinking-budget" in capsys.readouterr().err
+
+
+async def test_exit_code_ignores_warmup_failures_when_measured_phase_is_healthy() -> None:
+    # A transient warmup blip must not abort a multi-stage campaign whose
+    # measured phase succeeded; the warmup counts stay visible in the report.
+    import load_test as load_test_module
+
+    healthy_measured = {"failures": 0, "warmup": {"failures": 1}}
+    failed_measured = {"failures": 1, "warmup": {"failures": 0}}
+
+    assert load_test_module._exit_code(healthy_measured) == 0
+    assert load_test_module._exit_code(failed_measured) == 1
+
+
+async def test_cli_rejects_explicit_zero_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An explicit --concurrency 0 must be rejected, not silently replaced with
+    # the provider default and run at full concurrency.
+    import load_test as load_test_module
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "load_test.py",
+            "--synthetic",
+            "--concurrency",
+            "0",
+            "--requests",
+            "1",
+            "--warmup-requests",
+            "0",
+        ],
+    )
+
+    with pytest.raises(ValueError, match="concurrency"):
+        await load_test_module._main()
 
 
 @pytest.mark.parametrize(

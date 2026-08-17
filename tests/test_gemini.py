@@ -153,6 +153,29 @@ async def test_constructs_vertex_client_with_stable_api(
     await provider.close()
 
 
+async def test_transport_pool_is_sized_to_parallelism(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # httpx defaults to 20 keepalive connections; below the configured
+    # parallelism that forces TLS re-handshakes under load.
+    client = FakeClient([response()])
+    captured: dict[str, Any] = {}
+
+    class RecordingTransport(httpx.AsyncHTTPTransport):
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr("llm.gemini.httpx.AsyncHTTPTransport", RecordingTransport)
+    monkeypatch.setattr("llm.gemini.genai.Client", lambda **kwargs: client)
+    provider = Gemini(config(parallelism=48))
+
+    limits = captured["limits"]
+    assert limits.max_connections == 48
+    assert limits.max_keepalive_connections == 48
+    await provider.close()
+
+
 async def test_retries_resource_exhausted_with_full_jitter() -> None:
     request = httpx.Request("POST", "https://aiplatform.googleapis.com")
     rate_limited = errors.ClientError(

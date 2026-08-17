@@ -94,3 +94,54 @@ def _passing_output(case_id: str) -> str:
         "no-invented-facts-001": "unavailable",
     }
     return outputs[case_id]
+
+
+async def test_cli_reports_unsupported_control_cleanly(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # An unsupported control must exit with a clean usage error before any
+    # billable request is sent, not an unhandled traceback.
+    import quality_eval as quality_eval_module
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "quality_eval.py",
+            "--provider",
+            "together",
+            "--model",
+            "organization/model",
+            "--thinking-budget",
+            "0",
+        ],
+    )
+
+    assert await quality_eval_module._main() == 2
+    assert "thinking-budget" in capsys.readouterr().err
+
+
+async def test_case_tokens_come_only_from_declared_response_errors() -> None:
+    from llm import LLMResponseError
+
+    dataset = GoldenDataset.load(GOLDEN_DATASET)
+    outputs: dict[str, str | BaseException] = {
+        case.input: _passing_output(case.id) for case in dataset.cases
+    }
+
+    class UndeclaredBilledError(RuntimeError):
+        input_tokens = 7
+        output_tokens = 3
+
+    outputs[dataset.cases[0].input] = LLMResponseError(
+        "no usable text", input_tokens=7, output_tokens=3
+    )
+    outputs[dataset.cases[1].input] = UndeclaredBilledError("boom")
+
+    report = await evaluate_dataset(FakeQualityProvider(outputs), dataset, concurrency=2)
+
+    assert report["failed"] == 2
+    # Eight passing cases plus the declared error's tokens; attributes on an
+    # undeclared exception type are not trusted as billing telemetry.
+    assert report["observed_input_tokens"] == 8 * 5 + 7
+    assert report["observed_output_tokens"] == 8 * 2 + 3

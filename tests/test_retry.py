@@ -14,6 +14,7 @@ from llm import (
     RetryPolicy,
     retry_after_seconds,
     retry_with_backoff,
+    status_code_from_error,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -23,6 +24,32 @@ class ProviderError(RuntimeError):
     def __init__(self, status: int) -> None:
         super().__init__(f"provider error {status}")
         self.status = status
+
+
+async def test_status_code_from_error_prefers_numeric_code_over_status_text() -> None:
+    # google-genai errors carry an int `code` plus a string `status` such as
+    # "RESOURCE_EXHAUSTED"; the text must not shadow the number.
+    error = RuntimeError("rate limited")
+    error.code = 429  # type: ignore[attr-defined]
+    error.status = "RESOURCE_EXHAUSTED"  # type: ignore[attr-defined]
+
+    assert status_code_from_error(error) == 429
+
+
+async def test_status_code_from_error_skips_unparseable_values() -> None:
+    error = RuntimeError("unavailable")
+    error.status = "UNAVAILABLE"  # type: ignore[attr-defined]
+    error.status_code = 503  # type: ignore[attr-defined]
+
+    assert status_code_from_error(error) == 503
+
+
+async def test_status_code_from_error_accepts_numeric_status_strings() -> None:
+    assert status_code_from_error(ProviderError(429)) == 429
+
+
+async def test_status_code_from_error_returns_none_without_a_status() -> None:
+    assert status_code_from_error(RuntimeError("boom")) is None
 
 
 async def test_retries_with_full_jitter_and_reports_event() -> None:

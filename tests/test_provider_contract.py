@@ -105,3 +105,31 @@ async def test_registered_provider_implementation_satisfies_llm_contract(
     await provider.close()
     with pytest.raises(RuntimeError, match="closed"):
         await provider.ask_generic_question("system", "question", 0.2)
+
+
+def test_provider_response_errors_share_the_declared_base() -> None:
+    # Callers recover billable tokens from failures via one declared type, not
+    # duck-typed attribute names that each provider happens to share.
+    from llm import GeminiResponseError, LLMResponseError, TogetherResponseError
+
+    for error_type in (GeminiResponseError, TogetherResponseError):
+        error = error_type("no usable text", input_tokens=3, output_tokens=1)
+        assert isinstance(error, LLMResponseError)
+        assert (error.input_tokens, error.output_tokens) == (3, 1)
+
+
+def test_provider_metadata_reports_own_sdk_versions(
+    provider_case: ProviderCase,
+) -> None:
+    # Each provider owns its dependency report so the load harness never
+    # hardcodes another provider's packages.
+    import importlib.metadata
+
+    dependencies = provider_case.provider.metadata()["dependencies"]
+    expected_package = {"Gemini": "google-genai", "Together": "together"}[
+        provider_case.expected_name
+    ]
+
+    assert expected_package in dependencies
+    for name, version in dependencies.items():
+        assert version == importlib.metadata.version(name)

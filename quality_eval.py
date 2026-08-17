@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import platform
+import sys
 import time
 from collections import Counter
 from dataclasses import asdict, dataclass
@@ -14,6 +15,7 @@ from typing import Any
 from evals import GoldenCase, GoldenDataset, validate_output
 from llm import (
     LLM,
+    LLMResponseError,
     ProviderOptions,
     add_provider_arguments,
     create_provider,
@@ -90,14 +92,20 @@ async def _evaluate_case(provider: LLM, case: GoldenCase) -> CaseResult:
             case.temperature,
         )
     except Exception as error:
-        # Provider failures are quality failures but remain distinct from rule failures.
+        # Provider failures are quality failures but remain distinct from rule
+        # failures. Only the declared response-error contract carries billing.
+        billed_input, billed_output = (
+            (error.input_tokens, error.output_tokens)
+            if isinstance(error, LLMResponseError)
+            else (0, 0)
+        )
         return CaseResult(
             id=case.id,
             category=case.category,
             passed=False,
             latency_seconds=time.perf_counter() - started,
-            input_tokens=int(getattr(error, "input_tokens", 0) or 0),
-            output_tokens=int(getattr(error, "output_tokens", 0) or 0),
+            input_tokens=billed_input,
+            output_tokens=billed_output,
             output=None,
             validations=(),
             error_type=type(error).__name__,
@@ -135,15 +143,21 @@ def _parse_args() -> argparse.Namespace:
 async def _main() -> int:
     args = _parse_args()
     dataset = GoldenDataset.load(args.dataset)
-    provider = create_provider(
-        args.provider,
-        ProviderOptions(
-            model=args.model,
-            max_retries=args.max_retries,
-            max_output_tokens=args.max_output_tokens,
-            thinking_budget=args.thinking_budget,
-        ),
-    )
+    try:
+        provider = create_provider(
+            args.provider,
+            ProviderOptions(
+                model=args.model,
+                max_retries=args.max_retries,
+                max_output_tokens=args.max_output_tokens,
+                thinking_budget=args.thinking_budget,
+            ),
+        )
+    except ValueError as error:
+        # Configuration mistakes should fail as usage errors before any
+        # billable request, not as tracebacks.
+        print(f"error: {error}", file=sys.stderr)
+        return 2
     try:
         report = await evaluate_dataset(
             provider,

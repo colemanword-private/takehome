@@ -1,5 +1,5 @@
 from .gemini import Gemini, GeminiConfig, GeminiResponseError
-from .llm import LLM
+from .llm import LLM, LLMResponseError
 from .providers import (
     ProviderOptions,
     add_provider_arguments,
@@ -16,6 +16,7 @@ from .retry import (
     RetryPolicy,
     retry_after_seconds,
     retry_with_backoff,
+    status_code_from_error,
 )
 from .together import Together, TogetherConfig, TogetherResponseError
 
@@ -25,6 +26,7 @@ __all__ = [
     "GeminiConfig",
     "GeminiResponseError",
     "LLM",
+    "LLMResponseError",
     "ProviderOptions",
     "RetryBudget",
     "RetryDeadlineExceeded",
@@ -40,4 +42,5 @@ __all__ = [
     "provider_names",
     "retry_after_seconds",
     "retry_with_backoff",
+    "status_code_from_error",
 ]

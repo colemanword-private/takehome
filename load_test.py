@@ -3,10 +3,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
-import importlib.metadata
 import json
 import math
 import platform
+import sys
 import time
 from collections import Counter
 from dataclasses import asdict, dataclass
@@ -17,11 +17,13 @@ from typing import Any, Sequence
 from llm import (
     BackoffEvent,
     LLM,
+    LLMResponseError,
     ProviderOptions,
     RetryEvent,
     RetryExhaustedEvent,
     add_provider_arguments,
     create_provider,
+    status_code_from_error,
 )
 
 
@@ -119,62 +121,67 @@ class _PhaseResult:
 
 
 class RetryCounter:
+    """Aggregates retry telemetry; only counts are read, so no events are kept.
+
+    A long throttled run can produce one event per retry; storing aggregates
+    keeps memory constant regardless of run length.
+    """
+
     def __init__(self) -> None:
-        self._backoffs: list[BackoffEvent] = []
-        self._events: list[RetryEvent] = []
-        self._exhaustions: list[RetryExhaustedEvent] = []
+        self._reset_state()
+
+    def _reset_state(self) -> None:
+        self._retry_count = 0
+        self._retries_by_status: Counter[str] = Counter()
+        self._cumulative_backoff_seconds = 0.0
+        self._exhaustion_count = 0
+        self._exhaustions_by_reason: Counter[str] = Counter()
+        self._exhaustions_by_status: Counter[str] = Counter()
 
     def record_backoff(self, event: BackoffEvent) -> None:
-        self._backoffs.append(event)
+        self._cumulative_backoff_seconds += event.delay_seconds
 
     def record(self, event: RetryEvent) -> None:
-        self._events.append(event)
+        self._retry_count += 1
+        self._retries_by_status[_status_key(event)] += 1
 
     def record_exhaustion(self, event: RetryExhaustedEvent) -> None:
-        self._exhaustions.append(event)
+        self._exhaustion_count += 1
+        self._exhaustions_by_reason[event.reason] += 1
+        self._exhaustions_by_status[_status_key(event)] += 1
 
     def reset(self) -> None:
-        self._backoffs.clear()
-        self._events.clear()
-        self._exhaustions.clear()
+        self._reset_state()
 
     @property
     def count(self) -> int:
-        return len(self._events)
+        return self._retry_count
 
     @property
     def cumulative_backoff_seconds(self) -> float:
-        return sum(event.delay_seconds for event in self._backoffs)
+        return self._cumulative_backoff_seconds
 
     @property
     def exhaustion_count(self) -> int:
-        return len(self._exhaustions)
+        return self._exhaustion_count
 
     @property
     def exhaustions_by_reason(self) -> dict[str, int]:
-        return dict(Counter(event.reason for event in self._exhaustions))
+        return dict(self._exhaustions_by_reason)
 
     @property
     def exhaustions_by_status(self) -> dict[str, int]:
-        return dict(
-            Counter(
-                str(event.status_code)
-                if event.status_code is not None
-                else event.error_type
-                for event in self._exhaustions
-            )
-        )
+        return dict(self._exhaustions_by_status)
 
     @property
     def by_status(self) -> dict[str, int]:
-        return dict(
-            Counter(
-                str(event.status_code)
-                if event.status_code is not None
-                else event.error_type
-                for event in self._events
-            )
-        )
+        return dict(self._retries_by_status)
+
+
+def _status_key(event: RetryEvent | RetryExhaustedEvent) -> str:
+    if event.status_code is not None:
+        return str(event.status_code)
+    return event.error_type
 
 
 class SyntheticProvider(LLM):
@@ -301,16 +308,17 @@ async def _run_phase(
                 )
             except Exception as error:
                 request_finished = time.perf_counter()
+                billed_input, billed_output = _billed_tokens(error)
                 samples.append(
                     RequestSample(
                         success=False,
                         service_latency_seconds=request_finished - request_started,
                         end_to_end_latency_seconds=request_finished - scheduled_at,
                         queue_delay_seconds=request_started - scheduled_at,
-                        input_tokens=int(getattr(error, "input_tokens", 0) or 0),
-                        output_tokens=int(getattr(error, "output_tokens", 0) or 0),
+                        input_tokens=billed_input,
+                        output_tokens=billed_output,
                         error_type=type(error).__name__,
-                        status_code=_error_status_code(error),
+                        status_code=status_code_from_error(error),
                     )
                 )
             finally:
@@ -488,26 +496,19 @@ def _failure_key(sample: RequestSample) -> str:
     return sample.error_type or "unknown"
 
 
-def _error_status_code(error: BaseException) -> int | None:
-    code = (
-        getattr(error, "status", None)
-        or getattr(error, "status_code", None)
-        or getattr(error, "code", None)
-    )
-    try:
-        return int(code) if code is not None else None
-    except (TypeError, ValueError):
-        return None
+def _billed_tokens(error: BaseException) -> tuple[int, int]:
+    # Only the declared response-error contract carries billing telemetry.
+    if isinstance(error, LLMResponseError):
+        return error.input_tokens, error.output_tokens
+    return 0, 0
 
 
 def _runtime_metadata() -> dict[str, object]:
+    # Dependency versions are provider-owned metadata (see LLM.metadata), so
+    # the shared harness records only the interpreter and platform.
     return {
         "python": platform.python_version(),
         "platform": platform.platform(),
-        "dependencies": {
-            name: importlib.metadata.version(name)
-            for name in ("google-genai", "httpx", "together")
-        },
     }
 
 
@@ -554,34 +555,46 @@ async def _main() -> int:
     workload = Workload.load(args.workload)
     retry_counter = RetryCounter()
 
+    # `is None` checks keep an explicit 0 flowing into config validation instead
+    # of silently substituting the provider default.
     if args.synthetic:
-        provider: LLM = SyntheticProvider(args.concurrency or 128)
-        observed_retries: RetryCounter | None = retry_counter
-    else:
-        provider = create_provider(
-            args.provider,
-            ProviderOptions(
-                model=args.model,
-                max_retries=args.max_retries,
-                max_output_tokens=args.max_output_tokens,
-                thinking_budget=args.thinking_budget,
-                on_backoff=retry_counter.record_backoff,
-                on_retry=retry_counter.record,
-                on_exhausted=retry_counter.record_exhaustion,
-            ),
+        provider: LLM = SyntheticProvider(
+            args.concurrency if args.concurrency is not None else 128
         )
-        observed_retries = retry_counter
+    else:
+        try:
+            provider = create_provider(
+                args.provider,
+                ProviderOptions(
+                    model=args.model,
+                    max_retries=args.max_retries,
+                    max_output_tokens=args.max_output_tokens,
+                    thinking_budget=args.thinking_budget,
+                    on_backoff=retry_counter.record_backoff,
+                    on_retry=retry_counter.record,
+                    on_exhausted=retry_counter.record_exhaustion,
+                ),
+            )
+        except ValueError as error:
+            # Configuration mistakes should fail as usage errors before any
+            # billable request, not as tracebacks.
+            print(f"error: {error}", file=sys.stderr)
+            return 2
 
     try:
         config = LoadTestConfig(
             requests=args.requests,
-            concurrency=args.concurrency or provider.parallelism(),
+            concurrency=(
+                args.concurrency
+                if args.concurrency is not None
+                else provider.parallelism()
+            ),
             requests_per_second=args.rps,
             temperature=args.temperature,
             warmup_requests=args.warmup_requests,
             max_pending_requests=args.max_pending_requests,
         )
-        summary = await run_load_test(provider, workload, config, observed_retries)
+        summary = await run_load_test(provider, workload, config, retry_counter)
     finally:
         await provider.close()
 
@@ -590,9 +603,13 @@ async def _main() -> int:
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(f"{rendered}\n", encoding="utf-8")
-    if summary["failures"] or summary["warmup"]["failures"]:
-        return 1
-    return 0
+    return _exit_code(summary)
+
+
+def _exit_code(summary: dict[str, Any]) -> int:
+    # Warmup failures stay visible in the report but must not abort a campaign
+    # whose measured phase is healthy.
+    return 1 if summary["failures"] else 0
 
 if __name__ == "__main__":
     raise SystemExit(asyncio.run(_main()))

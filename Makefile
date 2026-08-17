@@ -5,10 +5,11 @@ PROJECT_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 PYTHON ?= $(PROJECT_DIR)/.venv/bin/python
 ENV_FILE ?= $(PROJECT_DIR)/.env
 
-# Select any provider registered in llm/providers.py. Gemini gets the assignment's
-# target model by default; other providers may use MODEL or their environment setting.
+# Select any provider registered in llm/providers.py. Model defaults live in each
+# provider's configuration; set MODEL to pin one explicitly (results are grouped
+# under "default" when unset).
 PROVIDER ?= gemini
-MODEL ?= $(if $(filter gemini,$(PROVIDER)),gemini-2.5-flash,)
+MODEL ?=
 PROVIDER_ARGS = --provider "$(PROVIDER)" $(if $(strip $(MODEL)),--model "$(MODEL)")
 
 # Resolve the timestamp once so every target in one Make invocation shares a run.
@@ -63,10 +64,9 @@ set +a;
 endef
 
 .PHONY: \
-	help bootstrap check-python check-provider check-config check-adc \
-	prepare-results test synthetic-smoke provider-smoke vertex-smoke quality \
-	quality-baseline quality-controlled capacity-ramp retry-off retry-on soak \
-	load-test quality-test
+	help bootstrap check-python check-provider prepare-results test \
+	synthetic-smoke provider-smoke quality quality-baseline quality-controlled \
+	capacity-ramp retry-off retry-on soak
 
 # Print available workflows and common overrides. This sends no provider requests.
 help:
@@ -120,9 +120,6 @@ check-provider: check-python
 	$(LOAD_PROVIDER_ENV) \
 	"$(PYTHON)" "$(PROJECT_DIR)/provider_check.py" $(PROVIDER_ARGS)
 
-# Compatibility aliases for the original Gemini-specific preflight target names.
-check-config check-adc: check-provider
-
 # Create this invocation's timestamped output directories.
 prepare-results:
 	@mkdir -p "$(LOAD_RESULTS_DIR)" "$(EVAL_RESULTS_DIR)" "$(SYNTHETIC_RESULTS_DIR)"
@@ -162,8 +159,14 @@ provider-smoke: check-provider prepare-results
 		--output "$(LOAD_RESULTS_DIR)/01-$(PROVIDER)-smoke.json"
 
 # BILLABLE: run both quality evaluations to compare environment-configured behavior
-# with explicit supported controls for the selected provider.
-quality: quality-baseline quality-controlled
+# with explicit supported controls for the selected provider. A baseline failure must
+# not skip the controlled run, or the paired comparison is lost after billable spend;
+# RUN_ID is forwarded so both sub-makes share one run directory.
+quality:
+	@status=0; \
+	$(MAKE) quality-baseline RUN_ID="$(RUN_ID)" || status=1; \
+	$(MAKE) quality-controlled RUN_ID="$(RUN_ID)" || status=1; \
+	exit $$status
 
 # BILLABLE: evaluate all golden cases with retries disabled and otherwise use the
 # selected provider's environment-configured defaults.
@@ -275,7 +278,3 @@ soak: check-provider prepare-results
 		--warmup-requests 5 \
 		--temperature "$(TEMPERATURE)" \
 		--output "$(LOAD_RESULTS_DIR)/07-$(PROVIDER)-soak-$(SOAK_RPS)rps.json"
-
-# Backward-compatible aliases for earlier instructions and scripts.
-vertex-smoke load-test: provider-smoke
-quality-test: quality-baseline

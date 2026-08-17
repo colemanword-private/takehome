@@ -1,6 +1,22 @@
 from dataclasses import dataclass
 
 
+class LLMResponseError(RuntimeError):
+    """Raised when a provider returns a response without usable answer text.
+
+    Carries the billable token usage of the failed attempt so callers can
+    observe cost from failures through one declared type instead of
+    duck-typed attribute names.
+    """
+
+    def __init__(
+        self, message: str, *, input_tokens: int, output_tokens: int
+    ) -> None:
+        super().__init__(message)
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+
+
 class LLM:
     @dataclass
     class SimpleResponse:

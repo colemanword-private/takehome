@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.metadata
 import inspect
 import math
 import os
@@ -14,8 +15,10 @@ from google import genai
 from google.auth import exceptions as google_auth_exceptions
 from google.genai import errors, types
 
-from .llm import LLM
+from ._env import env_float, env_int, env_optional_int
+from .llm import LLM, LLMResponseError
 from .retry import (
+    RETRYABLE_STATUS_CODES,
     BackoffEvent,
     RetryBudget,
     RetryEvent,
@@ -23,10 +26,8 @@ from .retry import (
     RetryPolicy,
     retry_after_seconds,
     retry_with_backoff,
+    status_code_from_error,
 )
-
-# Retrying other 4xx responses would amplify permanent configuration or prompt errors.
-_RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 _TRANSPORT_ERRORS = (
     TimeoutError,
     ConnectionError,
@@ -36,15 +37,8 @@ _TRANSPORT_ERRORS = (
 _HANDLED_ERRORS = (errors.APIError, *_TRANSPORT_ERRORS)
 
 
-class GeminiResponseError(RuntimeError):
+class GeminiResponseError(LLMResponseError):
     """Raised when Vertex returns a successful response without usable text."""
-
-    def __init__(
-        self, message: str, *, input_tokens: int, output_tokens: int
-    ) -> None:
-        super().__init__(message)
-        self.input_tokens = input_tokens
-        self.output_tokens = output_tokens
 
 
 @dataclass(frozen=True)
@@ -75,30 +69,30 @@ class GeminiConfig:
             project=project,
             location=os.getenv("GOOGLE_CLOUD_LOCATION", "global"),
             model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
-            parallelism=_env_int("GEMINI_PARALLELISM", 32, minimum=1),
-            timeout_seconds=_env_float(
+            parallelism=env_int("GEMINI_PARALLELISM", 32, minimum=1),
+            timeout_seconds=env_float(
                 "GEMINI_TIMEOUT_SECONDS", 20.0, minimum=0.001
             ),
-            request_deadline_seconds=_env_float(
+            request_deadline_seconds=env_float(
                 "GEMINI_REQUEST_DEADLINE_SECONDS", 60.0, minimum=0.001
             ),
-            max_retries=_env_int("GEMINI_MAX_RETRIES", 4, minimum=0),
-            retry_base_delay_seconds=_env_float(
+            max_retries=env_int("GEMINI_MAX_RETRIES", 4, minimum=0),
+            retry_base_delay_seconds=env_float(
                 "GEMINI_RETRY_BASE_DELAY_SECONDS", 0.5, minimum=0.0
             ),
-            retry_max_delay_seconds=_env_float(
+            retry_max_delay_seconds=env_float(
                 "GEMINI_RETRY_MAX_DELAY_SECONDS", 8.0, minimum=0.0
             ),
-            retry_budget_capacity=_env_int(
+            retry_budget_capacity=env_int(
                 "GEMINI_RETRY_BUDGET_CAPACITY", 32, minimum=1
             ),
-            retry_budget_refill_per_second=_env_float(
+            retry_budget_refill_per_second=env_float(
                 "GEMINI_RETRY_BUDGET_REFILL_PER_SECOND", 2.0, minimum=0.0
             ),
-            max_output_tokens=_env_optional_int(
+            max_output_tokens=env_optional_int(
                 "GEMINI_MAX_OUTPUT_TOKENS", minimum=1
             ),
-            thinking_budget=_env_optional_int(
+            thinking_budget=env_optional_int(
                 "GEMINI_THINKING_BUDGET", minimum=0
             ),
         )
@@ -193,7 +187,17 @@ class Gemini(LLM):
                 timeout=int(self._config.timeout_seconds * 1_000),
                 # The SDK otherwise selects aiohttp whenever it is installed, making
                 # the transport depend on unrelated packages in the environment.
-                async_client_args={"transport": httpx.AsyncHTTPTransport()},
+                async_client_args={
+                    "transport": httpx.AsyncHTTPTransport(
+                        # httpx's default 20-keepalive pool sits below our
+                        # parallelism, closing and re-handshaking connections
+                        # under load; size the pool to the declared parallelism.
+                        limits=httpx.Limits(
+                            max_connections=self._config.parallelism,
+                            max_keepalive_connections=self._config.parallelism,
+                        )
+                    )
+                },
             ),
         )
         self._async_client = self._client.aio
@@ -221,6 +225,12 @@ class Gemini(LLM):
             ),
             "max_output_tokens": self._config.max_output_tokens,
             "thinking_budget": self._config.thinking_budget,
+            # Each provider reports its own SDK versions so benchmark artifacts
+            # stay reproducible without the harness hardcoding package names.
+            "dependencies": {
+                name: importlib.metadata.version(name)
+                for name in ("google-genai", "httpx")
+            },
         }
 
     async def ask_generic_question(
@@ -311,7 +321,7 @@ class Gemini(LLM):
             policy=self._retry_policy,
             handled_errors=_HANDLED_ERRORS,
             is_retryable=_is_retryable,
-            status_code=_status_code,
+            status_code=status_code_from_error,
             retry_after=retry_after_seconds,
             retry_budget=self._retry_budget,
             total_timeout_seconds=self._config.request_deadline_seconds,
@@ -369,15 +379,7 @@ def _token_counts(response: Any) -> tuple[int, int]:
 def _is_retryable(error: BaseException) -> bool:
     if isinstance(error, _TRANSPORT_ERRORS):
         return True
-    return _status_code(error) in _RETRYABLE_STATUS_CODES
-
-
-def _status_code(error: BaseException) -> int | None:
-    code = getattr(error, "code", None) or getattr(error, "status", None)
-    try:
-        return int(code) if code is not None else None
-    except (TypeError, ValueError):
-        return None
+    return status_code_from_error(error) in RETRYABLE_STATUS_CODES
 
 
 def _empty_response_message(response: Any) -> str:
@@ -400,35 +402,3 @@ def _empty_response_message(response: Any) -> str:
     return f"Gemini returned no text{suffix}"
 
 
-def _env_int(name: str, default: int, *, minimum: int) -> int:
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return default
-    try:
-        value = int(raw_value)
-    except ValueError as error:
-        raise ValueError(f"{name} must be an integer") from error
-    if value < minimum:
-        raise ValueError(f"{name} must be at least {minimum}")
-    return value
-
-
-def _env_optional_int(name: str, *, minimum: int) -> int | None:
-    if os.getenv(name) is None:
-        return None
-    return _env_int(name, minimum, minimum=minimum)
-
-
-def _env_float(name: str, default: float, *, minimum: float) -> float:
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return default
-    try:
-        value = float(raw_value)
-    except ValueError as error:
-        raise ValueError(f"{name} must be a number") from error
-    if not math.isfinite(value):
-        raise ValueError(f"{name} must be finite")
-    if value < minimum:
-        raise ValueError(f"{name} must be at least {minimum}")
-    return value

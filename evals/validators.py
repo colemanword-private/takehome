@@ -103,7 +103,10 @@ def _max_words(output: str, config: dict[str, Any]) -> tuple[bool, str]:
 
 
 def _max_sentences(output: str, config: dict[str, Any]) -> tuple[bool, str]:
-    count = len(re.findall(r"[.!?]+(?:\s|$)", output.strip()))
+    # A boundary requires a following capitalized word so abbreviations such as
+    # "vs." do not fail a correct one-sentence answer. Undercounting is the safer
+    # error direction for a maximum check.
+    count = len(re.findall(r"[.!?]+(?=\s+[A-Z]|\s*$)", output.strip()))
     if output.strip() and count == 0:
         count = 1
     limit = config["max"]
@@ -112,17 +115,21 @@ def _max_sentences(output: str, config: dict[str, Any]) -> tuple[bool, str]:
 
 
 def _percentage_facts(output: str, config: dict[str, Any]) -> tuple[bool, str]:
-    # Exact set comparison catches both dropped facts and invented percentages.
-    actual = re.findall(r"(?<!\w)[+-]?\d+(?:\.\d+)?%", output)
-    expected = config["expected"]
+    # Signs are stripped and repeats collapsed so "+12%" or a restated figure
+    # still counts as the same fact; distinct invented percentages still fail.
+    actual = {
+        match.lstrip("+-")
+        for match in re.findall(r"(?<!\w)[+-]?\d+(?:\.\d+)?%", output)
+    }
+    expected = {value.lstrip("+-") for value in config["expected"]}
     allow_additional = config.get("allow_additional", False)
     if allow_additional:
-        missing = [value for value in expected if value not in actual]
+        missing = sorted(expected - actual)
         passed = not missing
         message = "all percentage facts are present" if passed else f"missing {missing!r}"
         return passed, message
-    passed = sorted(actual) == sorted(expected)
-    return passed, f"expected percentages {expected!r}; got {actual!r}"
+    passed = actual == expected
+    return passed, f"expected percentages {sorted(expected)!r}; got {sorted(actual)!r}"
 
 
 def _normalize(value: str, config: dict[str, Any]) -> str:
@@ -134,12 +141,17 @@ def _normalize(value: str, config: dict[str, Any]) -> str:
 
 
 def _matching_values(output: str, config: dict[str, Any]) -> list[str]:
+    # Word-bounded matching prevents "search" from matching inside "Research"
+    # or an excluded "color" from flagging "colorful".
     case_sensitive = config.get("case_sensitive", False)
     haystack = output if case_sensitive else output.casefold()
     return [
         value
         for value in config["values"]
-        if (value if case_sensitive else value.casefold()) in haystack
+        if re.search(
+            rf"(?<!\w){re.escape(value if case_sensitive else value.casefold())}(?!\w)",
+            haystack,
+        )
     ]
 
 

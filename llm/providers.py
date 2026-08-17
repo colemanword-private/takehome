@@ -27,11 +27,18 @@ class ProviderOptions:
     on_exhausted: RetryExhaustedObserver | None = None
 
 
+# Optional tuning fields on ProviderOptions that providers may not all support.
+_TUNING_CONTROLS = ("model", "max_retries", "max_output_tokens", "thinking_budget")
+
+
 @dataclass(frozen=True)
 class _ProviderSpec:
     name: str
     build: Callable[[ProviderOptions], LLM]
     check_readiness: Callable[[str | None], dict[str, object]]
+    # Declared capabilities let the registry reject unsupported controls
+    # uniformly instead of each builder raising its own ad hoc error.
+    controls: frozenset[str]
 
 
 def _build_gemini(options: ProviderOptions) -> LLM:
@@ -55,9 +62,6 @@ def _build_gemini(options: ProviderOptions) -> LLM:
 
 
 def _build_together(options: ProviderOptions) -> LLM:
-    if options.thinking_budget is not None:
-        raise ValueError("Together does not support thinking-budget controls")
-
     config = TogetherConfig.from_env(model=options.model)
     overrides = {
         name: value
@@ -76,9 +80,17 @@ def _build_together(options: ProviderOptions) -> LLM:
 
 
 _PROVIDERS = {
-    "gemini": _ProviderSpec("gemini", _build_gemini, check_gemini_readiness),
+    "gemini": _ProviderSpec(
+        "gemini",
+        _build_gemini,
+        check_gemini_readiness,
+        controls=frozenset(_TUNING_CONTROLS),
+    ),
     "together": _ProviderSpec(
-        "together", _build_together, check_together_readiness
+        "together",
+        _build_together,
+        check_together_readiness,
+        controls=frozenset(_TUNING_CONTROLS) - {"thinking_budget"},
     ),
 }
 
@@ -93,7 +105,19 @@ def create_provider(
     options: ProviderOptions | None = None,
 ) -> LLM:
     """Build a registered provider from shared experiment controls."""
-    return _provider_spec(name).build(options or ProviderOptions())
+    spec = _provider_spec(name)
+    resolved = options or ProviderOptions()
+    _validate_controls(spec, resolved)
+    return spec.build(resolved)
+
+
+def _validate_controls(spec: _ProviderSpec, options: ProviderOptions) -> None:
+    for control in _TUNING_CONTROLS:
+        if getattr(options, control) is not None and control not in spec.controls:
+            raise ValueError(
+                f"{spec.name} does not support the "
+                f"{control.replace('_', '-')} control"
+            )
 
 
 def check_provider_readiness(

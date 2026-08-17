@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.metadata
 import math
 import os
 import random
@@ -19,8 +20,10 @@ from together.types.chat.completion_create_params import (
     MessageChatCompletionUserMessageParam,
 )
 
-from .llm import LLM
+from ._env import env_float, env_int, env_optional_int
+from .llm import LLM, LLMResponseError
 from .retry import (
+    RETRYABLE_STATUS_CODES,
     BackoffEvent,
     RetryBudget,
     RetryEvent,
@@ -28,22 +31,14 @@ from .retry import (
     RetryPolicy,
     retry_after_seconds,
     retry_with_backoff,
+    status_code_from_error,
 )
-
-_RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 _TRANSPORT_ERRORS = (TimeoutError, ConnectionError, httpx.TransportError)
 _HANDLED_ERRORS = (APIError, *_TRANSPORT_ERRORS)
 
 
-class TogetherResponseError(RuntimeError):
+class TogetherResponseError(LLMResponseError):
     """Raised when Together returns a response without usable answer text."""
-
-    def __init__(
-        self, message: str, *, input_tokens: int, output_tokens: int
-    ) -> None:
-        super().__init__(message)
-        self.input_tokens = input_tokens
-        self.output_tokens = output_tokens
 
 
 @dataclass(frozen=True)
@@ -68,27 +63,27 @@ class TogetherConfig:
             raise ValueError("--model or TOGETHER_MODEL is required for Together")
         return cls(
             model=resolved_model,
-            parallelism=_env_int("TOGETHER_PARALLELISM", 100, minimum=1),
-            max_retries=_env_int("TOGETHER_MAX_RETRIES", 2, minimum=0),
-            retry_base_delay_seconds=_env_float(
+            parallelism=env_int("TOGETHER_PARALLELISM", 100, minimum=1),
+            max_retries=env_int("TOGETHER_MAX_RETRIES", 2, minimum=0),
+            retry_base_delay_seconds=env_float(
                 "TOGETHER_RETRY_BASE_DELAY_SECONDS", 0.5, minimum=0.0
             ),
-            retry_max_delay_seconds=_env_float(
+            retry_max_delay_seconds=env_float(
                 "TOGETHER_RETRY_MAX_DELAY_SECONDS", 8.0, minimum=0.0
             ),
-            max_output_tokens=_env_optional_int(
+            max_output_tokens=env_optional_int(
                 "TOGETHER_MAX_OUTPUT_TOKENS", minimum=1
             ),
-            timeout_seconds=_env_float(
+            timeout_seconds=env_float(
                 "TOGETHER_TIMEOUT_SECONDS", 20.0, minimum=0.001
             ),
-            request_deadline_seconds=_env_float(
+            request_deadline_seconds=env_float(
                 "TOGETHER_REQUEST_DEADLINE_SECONDS", 60.0, minimum=0.001
             ),
-            retry_budget_capacity=_env_int(
+            retry_budget_capacity=env_int(
                 "TOGETHER_RETRY_BUDGET_CAPACITY", 32, minimum=1
             ),
-            retry_budget_refill_per_second=_env_float(
+            retry_budget_refill_per_second=env_float(
                 "TOGETHER_RETRY_BUDGET_REFILL_PER_SECOND", 2.0, minimum=0.0
             ),
         )
@@ -184,6 +179,12 @@ class Together(LLM):
                 self._config.retry_budget_refill_per_second
             ),
             "max_output_tokens": self._config.max_output_tokens,
+            # Each provider reports its own SDK versions so benchmark artifacts
+            # stay reproducible without the harness hardcoding package names.
+            "dependencies": {
+                name: importlib.metadata.version(name)
+                for name in ("together", "httpx")
+            },
         }
 
     async def ask_generic_question(
@@ -221,7 +222,7 @@ class Together(LLM):
             policy=self._retry_policy,
             handled_errors=_HANDLED_ERRORS,
             is_retryable=_is_retryable,
-            status_code=_status_code,
+            status_code=status_code_from_error,
             retry_after=retry_after_seconds,
             retry_budget=self._retry_budget,
             total_timeout_seconds=self._config.request_deadline_seconds,
@@ -276,47 +277,7 @@ def _is_retryable(error: BaseException) -> bool:
     if isinstance(error, (APIConnectionError, *_TRANSPORT_ERRORS)):
         return True
     if isinstance(error, APIStatusError):
-        return _status_code(error) in _RETRYABLE_STATUS_CODES
+        return status_code_from_error(error) in RETRYABLE_STATUS_CODES
     return False
 
 
-def _status_code(error: BaseException) -> int | None:
-    code = getattr(error, "status_code", None) or getattr(error, "status", None)
-    try:
-        return int(code) if code is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
-def _env_int(name: str, default: int, *, minimum: int) -> int:
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return default
-    try:
-        value = int(raw_value)
-    except ValueError as error:
-        raise ValueError(f"{name} must be an integer") from error
-    if value < minimum:
-        raise ValueError(f"{name} must be at least {minimum}")
-    return value
-
-
-def _env_optional_int(name: str, *, minimum: int) -> int | None:
-    if os.getenv(name) is None:
-        return None
-    return _env_int(name, minimum, minimum=minimum)
-
-
-def _env_float(name: str, default: float, *, minimum: float) -> float:
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return default
-    try:
-        value = float(raw_value)
-    except ValueError as error:
-        raise ValueError(f"{name} must be a number") from error
-    if not math.isfinite(value):
-        raise ValueError(f"{name} must be finite")
-    if value < minimum:
-        raise ValueError(f"{name} must be at least {minimum}")
-    return value

@@ -56,11 +56,38 @@ GOLDEN_DATASET = Path(__file__).parents[1] / "evals" / "golden_dataset.json"
             {"type": "max_sentences", "max": 1},
         ),
         (
+            "CPA fell 5% vs. last week.",
+            {"type": "max_sentences", "max": 1},
+        ),
+        (
             "Spend rose 12%, conversions rose 18%, and CPA fell 5%.",
             {
                 "type": "percentage_facts",
                 "expected": ["12%", "18%", "5%"],
             },
+        ),
+        (
+            "Spend rose +12%, conversions rose +18%, and CPA fell -5%.",
+            {
+                "type": "percentage_facts",
+                "expected": ["12%", "18%", "5%"],
+            },
+        ),
+        (
+            "Spend rose 12%, conversions rose 18%, and CPA fell 5%; "
+            "the 12% rise drove the gain.",
+            {
+                "type": "percentage_facts",
+                "expected": ["12%", "18%", "5%"],
+            },
+        ),
+        (
+            "Research improved this quarter.",
+            {"type": "excludes_all", "values": ["search"]},
+        ),
+        (
+            "The colorful banner performed well.",
+            {"type": "excludes_all", "values": ["color"]},
         ),
     ],
 )
@@ -81,7 +108,18 @@ def test_deterministic_validator_passes(
         ("negative", {"type": "exact_match", "expected": "positive"}),
         ("```json\n{}\n```", {"type": "json_equals", "expected": {}}),
         ("Search improved.", {"type": "contains_all", "values": ["display"]}),
+        (
+            "Research improved this quarter.",
+            {"type": "contains_all", "values": ["search"]},
+        ),
         ("Use a color check.", {"type": "excludes_all", "values": ["color"]}),
+        (
+            "Spend rose 12%, 18%, and 5%, and margin rose 7%.",
+            {
+                "type": "percentage_facts",
+                "expected": ["12%", "18%", "5%"],
+            },
+        ),
         ("one two three", {"type": "max_words", "max": 2}),
         ("One. Two.", {"type": "max_sentences", "max": 1}),
         (

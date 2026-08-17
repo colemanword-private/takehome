@@ -152,13 +152,15 @@ def test_provider_factory_rejects_unknown_or_unsupported_options(
 ) -> None:
     with pytest.raises(ValueError, match="unknown provider"):
         create_provider("missing")
-    with pytest.raises(ValueError, match="thinking-budget controls"):
+    # The registry validates declared capabilities uniformly, before any
+    # provider construction, so no env or credentials are required.
+    with pytest.raises(
+        ValueError,
+        match=r"together does not support the thinking-budget control",
+    ):
         create_provider(
             "together",
-            ProviderOptions(
-                model="organization/model",
-                thinking_budget=thinking_budget,
-            ),
+            ProviderOptions(thinking_budget=thinking_budget),
         )
 
 
